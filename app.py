@@ -1,385 +1,568 @@
-from flask import Flask, render_template_string
-import yfinance as yf
+from flask import Flask, render_template_string, Response
+import os
+import json
+import time
+import threading
+import queue
+import websocket
 
 app = Flask(__name__)
 
+API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+
+# Twelve Data commodity symbols
+SYMBOLS = {
+    "XAU/USD": "gold",
+    "WTI/USD": "oil"
+}
+
+latest = {
+    "gold": {
+        "price": None,
+        "status": "Connecting..."
+    },
+    "oil": {
+        "price": None,
+        "status": "Connecting..."
+    }
+}
+
+clients = []
+clients_lock = threading.Lock()
+state_lock = threading.Lock()
+
+
+def broadcast(data):
+    message = json.dumps(data)
+
+    with clients_lock:
+        dead_clients = []
+
+        for client_queue in clients:
+            try:
+                client_queue.put_nowait(message)
+            except Exception:
+                dead_clients.append(client_queue)
+
+        for dead in dead_clients:
+            if dead in clients:
+                clients.remove(dead)
+
+
+def update_price(symbol, price, timestamp=None):
+
+    asset = SYMBOLS.get(symbol)
+
+    if not asset:
+        return
+
+    with state_lock:
+        latest[asset]["price"] = price
+        latest[asset]["status"] = "LIVE"
+
+    broadcast({
+        "type": "price",
+        "asset": asset,
+        "symbol": symbol,
+        "price": price,
+        "timestamp": timestamp or time.time()
+    })
+
+
+def update_status(status):
+
+    with state_lock:
+        latest["gold"]["status"] = status
+        latest["oil"]["status"] = status
+
+    broadcast({
+        "type": "status",
+        "status": status
+    })
+
+
+def heartbeat(ws):
+
+    while True:
+
+        try:
+            time.sleep(10)
+
+            if ws.sock and ws.sock.connected:
+                ws.send(json.dumps({
+                    "action": "heartbeat"
+                }))
+
+        except Exception:
+            break
+
+
+def websocket_worker():
+
+    if not API_KEY:
+        update_status("API KEY MISSING")
+        return
+
+    while True:
+
+        try:
+
+            update_status("CONNECTING")
+
+            url = (
+                "wss://ws.twelvedata.com/v1/quotes/price"
+                "?apikey=" + API_KEY
+            )
+
+            def on_open(ws):
+
+                subscribe_message = {
+                    "action": "subscribe",
+                    "params": {
+                        "symbols": "XAU/USD,WTI/USD"
+                    }
+                }
+
+                ws.send(json.dumps(subscribe_message))
+
+                update_status("CONNECTED")
+
+                threading.Thread(
+                    target=heartbeat,
+                    args=(ws,),
+                    daemon=True
+                ).start()
+
+            def on_message(ws, message):
+
+                try:
+
+                    data = json.loads(message)
+
+                    event = data.get("event")
+
+                    if event == "price":
+
+                        symbol = data.get("symbol")
+                        price = data.get("price")
+                        timestamp = data.get("timestamp")
+
+                        if symbol and price is not None:
+
+                            update_price(
+                                symbol,
+                                float(price),
+                                timestamp
+                            )
+
+                    elif event == "subscribe-status":
+
+                        broadcast({
+                            "type": "subscription",
+                            "data": data
+                        })
+
+                except Exception:
+                    pass
+
+            def on_error(ws, error):
+
+                update_status("CONNECTION ERROR")
+
+            def on_close(ws, close_status_code, close_msg):
+
+                update_status("RECONNECTING")
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception:
+
+            update_status("RECONNECTING")
+
+        time.sleep(5)
+
+
+def start_live_engine():
+
+    thread = threading.Thread(
+        target=websocket_worker,
+        daemon=True
+    )
+
+    thread.start()
+
+
 HTML = """
 <!DOCTYPE html>
+
 <html>
+
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trading-AI</title>
 
-    <style>
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: #0f172a;
-            color: white;
-        }
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
 
-        .container {
-            max-width: 850px;
-            margin: auto;
-            padding: 25px 15px;
-        }
+<title>Trading-AI Live</title>
 
-        h1 {
-            text-align: center;
-            color: #60a5fa;
-            margin-bottom: 5px;
-        }
+<style>
 
-        .subtitle {
-            text-align: center;
-            color: #94a3b8;
-            margin-bottom: 25px;
-        }
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: white;
+}
 
-        .card {
-            background: #1e293b;
-            border-radius: 16px;
-            padding: 22px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 18px rgba(0,0,0,0.3);
-        }
+.container {
+    max-width: 850px;
+    margin: auto;
+    padding: 25px 15px;
+}
 
-        .card h2 {
-            margin-top: 0;
-        }
+h1 {
+    text-align: center;
+    color: #60a5fa;
+    margin-bottom: 5px;
+}
 
-        .price {
-            font-size: 34px;
-            font-weight: bold;
-            margin: 15px 0;
-        }
+.subtitle {
+    text-align: center;
+    color: #94a3b8;
+    margin-bottom: 25px;
+}
 
-        .row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px solid #334155;
-        }
+.live-status {
+    text-align: center;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 12px;
+    margin-bottom: 20px;
+}
 
-        .label {
-            color: #94a3b8;
-        }
+.dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #facc15;
+    margin-right: 7px;
+}
 
-        .up {
-            color: #22c55e;
-            font-weight: bold;
-        }
+.card {
+    background: #1e293b;
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 20px;
+    box-shadow: 0 5px 18px rgba(0,0,0,0.3);
+}
 
-        .down {
-            color: #ef4444;
-            font-weight: bold;
-        }
+.card h2 {
+    margin-top: 0;
+}
 
-        .neutral {
-            color: #facc15;
-            font-weight: bold;
-        }
+.price {
+    font-size: 38px;
+    font-weight: bold;
+    margin: 15px 0;
+}
 
-        .signal {
-            margin-top: 18px;
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-            font-size: 21px;
-            font-weight: bold;
-            background: #334155;
-        }
+.live-label {
+    font-size: 13px;
+    color: #22c55e;
+    font-weight: bold;
+}
 
-        .refresh {
-            display: block;
-            margin: 25px auto;
-            padding: 13px 28px;
-            border: none;
-            border-radius: 10px;
-            background: #2563eb;
-            color: white;
-            font-size: 16px;
-            cursor: pointer;
-        }
+.row {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid #334155;
+}
 
-        .footer {
-            text-align: center;
-            color: #64748b;
-            font-size: 13px;
-            margin-top: 25px;
-        }
-    </style>
+.label {
+    color: #94a3b8;
+}
+
+.status {
+    color: #22c55e;
+    font-weight: bold;
+}
+
+.info {
+    color: #94a3b8;
+    text-align: center;
+    margin-top: 25px;
+    font-size: 13px;
+}
+
+</style>
+
 </head>
 
 <body>
 
 <div class="container">
 
-    <h1>Trading-AI</h1>
+<h1>Trading-AI</h1>
 
-    <div class="subtitle">
-        Gold + Crude Oil Market Intelligence
-    </div>
+<div class="subtitle">
+Gold + Crude Oil Live Market Intelligence
+</div>
 
-    <div class="card">
-        <h2>🛢️ Crude Oil — WTI</h2>
+<div class="live-status">
 
-        <div class="price">{{ oil.price }}</div>
+<span class="dot" id="statusDot"></span>
 
-        <div class="row">
-            <span class="label">1 Minute</span>
-            <span class="{{ oil.m1_class }}">{{ oil.m1 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">5 Minute</span>
-            <span class="{{ oil.m5_class }}">{{ oil.m5 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">15 Minute</span>
-            <span class="{{ oil.m15_class }}">{{ oil.m15 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">1 Hour</span>
-            <span class="{{ oil.h1_class }}">{{ oil.h1 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Momentum</span>
-            <span class="{{ oil.momentum_class }}">{{ oil.momentum }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Support</span>
-            <span>{{ oil.support }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Resistance</span>
-            <span>{{ oil.resistance }}</span>
-        </div>
-
-        <div class="signal">
-            Market Condition: {{ oil.condition }}
-        </div>
-    </div>
-
-
-    <div class="card">
-        <h2>🥇 Gold</h2>
-
-        <div class="price">{{ gold.price }}</div>
-
-        <div class="row">
-            <span class="label">1 Minute</span>
-            <span class="{{ gold.m1_class }}">{{ gold.m1 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">5 Minute</span>
-            <span class="{{ gold.m5_class }}">{{ gold.m5 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">15 Minute</span>
-            <span class="{{ gold.m15_class }}">{{ gold.m15 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">1 Hour</span>
-            <span class="{{ gold.h1_class }}">{{ gold.h1 }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Momentum</span>
-            <span class="{{ gold.momentum_class }}">{{ gold.momentum }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Support</span>
-            <span>{{ gold.support }}</span>
-        </div>
-
-        <div class="row">
-            <span class="label">Resistance</span>
-            <span>{{ gold.resistance }}</span>
-        </div>
-
-        <div class="signal">
-            Market Condition: {{ gold.condition }}
-        </div>
-    </div>
-
-
-    <button class="refresh" onclick="location.reload()">
-        🔄 Refresh Market
-    </button>
-
-    <div class="footer">
-        Trading-AI • Gold + Crude Oil Intelligence Engine
-    </div>
+<span id="connectionStatus">
+Connecting to live market...
+</span>
 
 </div>
 
-</body>
-</html>
-"""
+
+<div class="card">
+
+<h2>🛢️ Crude Oil — WTI</h2>
+
+<div class="live-label">
+● LIVE STREAM
+</div>
+
+<div class="price" id="oilPrice">
+Waiting...
+</div>
+
+<div class="row">
+<span class="label">Connection</span>
+<span class="status" id="oilStatus">
+Connecting...
+</span>
+</div>
+
+</div>
 
 
-def get_market_data(symbol):
+<div class="card">
 
-    try:
-        data = yf.Ticker(symbol).history(
-            period="5d",
-            interval="5m"
-        )
+<h2>🥇 Gold</h2>
 
-        if data.empty:
-            return {
-                "price": "Unavailable",
-                "m1": "Unavailable",
-                "m5": "Unavailable",
-                "m15": "Unavailable",
-                "h1": "Unavailable",
-                "momentum": "Unavailable",
-                "support": "Unavailable",
-                "resistance": "Unavailable",
-                "condition": "Data unavailable"
+<div class="live-label">
+● LIVE STREAM
+</div>
+
+<div class="price" id="goldPrice">
+Waiting...
+</div>
+
+<div class="row">
+<span class="label">Connection</span>
+<span class="status" id="goldStatus">
+Connecting...
+</span>
+</div>
+
+</div>
+
+
+<div class="info">
+
+Trading-AI Live Engine<br>
+Price updates are pushed automatically — no page refresh required.
+
+</div>
+
+</div>
+
+
+<script>
+
+const stream = new EventSource("/stream");
+
+
+stream.onopen = function() {
+
+    document.getElementById(
+        "connectionStatus"
+    ).innerText = "LIVE CONNECTION ACTIVE";
+
+    document.getElementById(
+        "statusDot"
+    ).style.background = "#22c55e";
+
+};
+
+
+stream.onmessage = function(event) {
+
+    try {
+
+        const data = JSON.parse(event.data);
+
+
+        if (data.type === "price") {
+
+            const price =
+                Number(data.price).toLocaleString(
+                    undefined,
+                    {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    }
+                );
+
+
+            if (data.asset === "oil") {
+
+                document.getElementById(
+                    "oilPrice"
+                ).innerText = "$" + price;
+
+                document.getElementById(
+                    "oilStatus"
+                ).innerText = "LIVE";
+
             }
 
-        close = data["Close"].dropna()
 
-        current = float(close.iloc[-1])
+            if (data.asset === "gold") {
 
-        def trend(periods):
+                document.getElementById(
+                    "goldPrice"
+                ).innerText = "$" + price;
 
-            if len(close) < periods + 1:
-                return "N/A", "neutral"
+                document.getElementById(
+                    "goldStatus"
+                ).innerText = "LIVE";
 
-            old = float(close.iloc[-periods - 1])
+            }
 
-            if current > old:
-                return "UP", "up"
-
-            elif current < old:
-                return "DOWN", "down"
-
-            return "FLAT", "neutral"
-
-
-        m1, m1_class = trend(1)
-        m5, m5_class = trend(5)
-        m15, m15_class = trend(15)
-        h1, h1_class = trend(60)
-
-
-        momentum_change = 0
-
-        if len(close) >= 10:
-            old = float(close.iloc[-10])
-            momentum_change = ((current - old) / old) * 100
-
-
-        if momentum_change > 0.15:
-            momentum = "STRONG"
-            momentum_class = "up"
-
-        elif momentum_change < -0.15:
-            momentum = "WEAK"
-            momentum_class = "down"
-
-        else:
-            momentum = "NEUTRAL"
-            momentum_class = "neutral"
-
-
-        recent = close.tail(60)
-
-        support = float(recent.min())
-        resistance = float(recent.max())
-
-
-        up_count = sum([
-            m1 == "UP",
-            m5 == "UP",
-            m15 == "UP",
-            h1 == "UP"
-        ])
-
-        down_count = sum([
-            m1 == "DOWN",
-            m5 == "DOWN",
-            m15 == "DOWN",
-            h1 == "DOWN"
-        ])
-
-
-        if up_count >= 3:
-            condition = "BULLISH"
-
-        elif down_count >= 3:
-            condition = "BEARISH"
-
-        else:
-            condition = "MIXED / WAIT"
-
-
-        return {
-            "price": f"${current:,.2f}",
-
-            "m1": m1,
-            "m1_class": m1_class,
-
-            "m5": m5,
-            "m5_class": m5_class,
-
-            "m15": m15,
-            "m15_class": m15_class,
-
-            "h1": h1,
-            "h1_class": h1_class,
-
-            "momentum": momentum,
-            "momentum_class": momentum_class,
-
-            "support": f"${support:,.2f}",
-            "resistance": f"${resistance:,.2f}",
-
-            "condition": condition
         }
 
-    except Exception as e:
 
-        return {
-            "price": "Unavailable",
-            "m1": "Unavailable",
-            "m5": "Unavailable",
-            "m15": "Unavailable",
-            "h1": "Unavailable",
-            "momentum": "Unavailable",
-            "support": "Unavailable",
-            "resistance": "Unavailable",
-            "condition": "Data unavailable"
+        if (data.type === "status") {
+
+            document.getElementById(
+                "connectionStatus"
+            ).innerText = data.status;
+
         }
+
+    }
+
+    catch(error) {
+
+        console.log(error);
+
+    }
+
+};
+
+
+stream.onerror = function() {
+
+    document.getElementById(
+        "connectionStatus"
+    ).innerText = "LIVE CONNECTION LOST — RECONNECTING";
+
+    document.getElementById(
+        "statusDot"
+    ).style.background = "#ef4444";
+
+};
+
+</script>
+
+
+</body>
+
+</html>
+"""
 
 
 @app.route("/")
 def home():
 
-    oil = get_market_data("CL=F")
+    return render_template_string(HTML)
 
-    gold = get_market_data("GC=F")
 
-    return render_template_string(
-        HTML,
-        oil=oil,
-        gold=gold
+@app.route("/stream")
+def stream():
+
+    client_queue = queue.Queue()
+
+    with clients_lock:
+        clients.append(client_queue)
+
+    def generate():
+
+        try:
+
+            with state_lock:
+
+                initial_state = {
+                    "type": "initial",
+                    "gold": latest["gold"],
+                    "oil": latest["oil"]
+                }
+
+            yield "data: " + json.dumps(initial_state) + "\\n\\n"
+
+            while True:
+
+                try:
+
+                    message = client_queue.get(
+                        timeout=15
+                    )
+
+                    yield "data: " + message + "\\n\\n"
+
+                except queue.Empty:
+
+                    yield ": keepalive\\n\\n"
+
+        finally:
+
+            with clients_lock:
+
+                if client_queue in clients:
+                    clients.remove(client_queue)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
     )
 
 
+@app.route("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "live_engine": True
+    }
+
+
 if __name__ == "__main__":
+
+    start_live_engine()
+
     app.run(
         host="0.0.0.0",
         port=10000
