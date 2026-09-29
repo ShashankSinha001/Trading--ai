@@ -21,11 +21,12 @@ GOLD_SYMBOL = "XAU/USD"
 if not API_KEY:
     print("WARNING: TWELVE_DATA_API_KEY is missing", flush=True)
 
+
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
-lock = threading.Lock()
+lock = threading.RLock()
 
 gold_prices = deque(maxlen=500)
 
@@ -76,8 +77,9 @@ latest = {
     }
 }
 
+
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def to_float(value):
@@ -96,7 +98,7 @@ def avg(values):
     return sum(values) / len(values)
 
 
-def closes(interval):
+def get_closes(interval):
     with lock:
         data = list(candles.get(interval, []))
 
@@ -111,12 +113,15 @@ def closes(interval):
     return result
 
 
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
 def ema(values, period):
     if not values:
         return None
 
-    if len(values) < period:
-        period = len(values)
+    period = min(period, len(values))
 
     if period <= 0:
         return None
@@ -126,7 +131,7 @@ def ema(values, period):
     result = values[0]
 
     for price in values[1:]:
-        result = (price - result) * multiplier + result
+        result = ((price - result) * multiplier) + result
 
     return result
 
@@ -148,11 +153,11 @@ def calculate_rsi(values, period=14):
             gains.append(0)
             losses.append(abs(change))
 
-    recent_gains = gains[-period:]
-    recent_losses = losses[-period:]
+    gains = gains[-period:]
+    losses = losses[-period:]
 
-    avg_gain = sum(recent_gains) / period
-    avg_loss = sum(recent_losses) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     if avg_loss == 0:
         return 100.0
@@ -234,10 +239,39 @@ def liquidity_levels(values):
 
     recent = values[-30:]
 
-    buy_liquidity = min(recent)
-    sell_liquidity = max(recent)
+    return min(recent), max(recent)
 
-    return buy_liquidity, sell_liquidity
+
+# ============================================================
+# LIVE PRICE STATE
+# ============================================================
+
+def update_live_price(price):
+    """
+    IMPORTANT:
+    Live WebSocket price is written directly into latest state.
+    Analysis failure cannot prevent the price from appearing.
+    """
+
+    if price is None:
+        return
+
+    price = float(price)
+
+    with lock:
+        gold_prices.append(price)
+
+        latest["gold"]["price"] = round(price, 5)
+        latest["gold"]["status"] = "live"
+        latest["gold"]["source"] = "Twelve Data WebSocket"
+        latest["gold"]["updated"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+    print(
+        f"STATE UPDATED: GOLD = {price}",
+        flush=True
+    )
 
 
 # ============================================================
@@ -246,300 +280,345 @@ def liquidity_levels(values):
 
 def calculate_analysis(live_price=None):
 
-    data_5m = closes("5min")
-    data_15m = closes("15min")
-    data_1h = closes("1h")
-    data_1d = closes("1day")
+    try:
 
-    with lock:
-        live_ticks = list(gold_prices)
+        data_5m = get_closes("5min")
+        data_15m = get_closes("15min")
+        data_1h = get_closes("1h")
+        data_1d = get_closes("1day")
 
-    # Use candle price if websocket price isn't available yet
-    price = live_price
+        with lock:
+            live_ticks = list(gold_prices)
 
-    if price is None and live_ticks:
-        price = live_ticks[-1]
+        price = live_price
 
-    if price is None:
-        fallback = data_5m or data_15m or data_1h
+        if price is None and live_ticks:
+            price = live_ticks[-1]
 
-        if fallback:
-            price = fallback[-1]
+        if price is None:
+            for data in [data_5m, data_15m, data_1h, data_1d]:
+                if data:
+                    price = data[-1]
+                    break
 
-    if price is None:
-        return
+        if price is None:
+            return
 
-    trend_5m = trend_from_values(data_5m)
-    trend_15m = trend_from_values(data_15m)
-    trend_1h = trend_from_values(data_1h)
-    trend_1d = trend_from_values(data_1d)
+        trend_5m = trend_from_values(data_5m)
+        trend_15m = trend_from_values(data_15m)
+        trend_1h = trend_from_values(data_1h)
+        trend_1d = trend_from_values(data_1d)
 
-    momentum_5m = momentum_from_values(data_5m)
-    structure_5m = structure_from_values(data_5m)
+        momentum = momentum_from_values(data_5m)
+        structure = structure_from_values(data_5m)
 
-    analysis_values = data_5m
+        analysis_values = data_5m
 
-    if len(analysis_values) < 20:
-        analysis_values = data_15m
+        if len(analysis_values) < 20:
+            analysis_values = data_15m
 
-    rsi_value = calculate_rsi(analysis_values)
+        if len(analysis_values) < 20:
+            analysis_values = data_1h
 
-    ema20_value = ema(analysis_values, 20)
-    ema50_value = ema(analysis_values, 50)
+        rsi_value = calculate_rsi(analysis_values)
 
-    buy_liquidity, sell_liquidity = liquidity_levels(analysis_values)
+        ema20_value = ema(analysis_values, 20)
+        ema50_value = ema(analysis_values, 50)
 
-    # ========================================================
-    # SCORING ENGINE
-    # ========================================================
+        buy_liquidity, sell_liquidity = liquidity_levels(
+            analysis_values
+        )
 
-    score = 0
-    reasons = []
+        # ====================================================
+        # SCORE
+        # ====================================================
 
-    # 5 MIN
-    if trend_5m == "BULLISH":
-        score += 2
-        reasons.append("5m trend bullish")
-    elif trend_5m == "BEARISH":
-        score -= 2
-        reasons.append("5m trend bearish")
+        score = 0
+        reasons = []
 
-    # 15 MIN
-    if trend_15m == "BULLISH":
-        score += 2
-        reasons.append("15m trend bullish")
-    elif trend_15m == "BEARISH":
-        score -= 2
-        reasons.append("15m trend bearish")
+        if trend_5m == "BULLISH":
+            score += 2
+            reasons.append("5m bullish")
 
-    # 1 HOUR
-    if trend_1h == "BULLISH":
-        score += 3
-        reasons.append("1H trend bullish")
-    elif trend_1h == "BEARISH":
-        score -= 3
-        reasons.append("1H trend bearish")
+        elif trend_5m == "BEARISH":
+            score -= 2
+            reasons.append("5m bearish")
 
-    # DAILY
-    if trend_1d == "BULLISH":
-        score += 3
-        reasons.append("1D trend bullish")
-    elif trend_1d == "BEARISH":
-        score -= 3
-        reasons.append("1D trend bearish")
+        if trend_15m == "BULLISH":
+            score += 2
+            reasons.append("15m bullish")
 
-    # MOMENTUM
-    if momentum_5m == "BULLISH":
-        score += 1
-        reasons.append("short-term momentum positive")
-    elif momentum_5m == "BEARISH":
-        score -= 1
-        reasons.append("short-term momentum negative")
+        elif trend_15m == "BEARISH":
+            score -= 2
+            reasons.append("15m bearish")
 
-    # STRUCTURE
-    if structure_5m == "BULLISH":
-        score += 2
-        reasons.append("market structure bullish")
-    elif structure_5m == "BEARISH":
-        score -= 2
-        reasons.append("market structure bearish")
+        if trend_1h == "BULLISH":
+            score += 3
+            reasons.append("1H bullish")
 
-    # EMA 20
-    if ema20_value is not None:
+        elif trend_1h == "BEARISH":
+            score -= 3
+            reasons.append("1H bearish")
 
-        if price > ema20_value:
+        if trend_1d == "BULLISH":
+            score += 3
+            reasons.append("1D bullish")
+
+        elif trend_1d == "BEARISH":
+            score -= 3
+            reasons.append("1D bearish")
+
+        if momentum == "BULLISH":
             score += 1
-            reasons.append("price above EMA20")
+            reasons.append("momentum positive")
 
-        elif price < ema20_value:
+        elif momentum == "BEARISH":
             score -= 1
-            reasons.append("price below EMA20")
+            reasons.append("momentum negative")
 
-    # EMA 50
-    if ema50_value is not None:
+        if structure == "BULLISH":
+            score += 2
+            reasons.append("structure bullish")
 
-        if price > ema50_value:
-            score += 1
-            reasons.append("price above EMA50")
+        elif structure == "BEARISH":
+            score -= 2
+            reasons.append("structure bearish")
 
-        elif price < ema50_value:
-            score -= 1
-            reasons.append("price below EMA50")
+        if ema20_value is not None:
 
-    # RSI
-    if rsi_value is not None:
+            if price > ema20_value:
+                score += 1
+                reasons.append("above EMA20")
 
-        if 55 <= rsi_value <= 70:
-            score += 1
-            reasons.append("RSI supports bullish momentum")
+            elif price < ema20_value:
+                score -= 1
+                reasons.append("below EMA20")
 
-        elif 30 <= rsi_value <= 45:
-            score -= 1
-            reasons.append("RSI supports bearish momentum")
+        if ema50_value is not None:
 
-        elif rsi_value > 75:
-            reasons.append("RSI is overbought")
+            if price > ema50_value:
+                score += 1
+                reasons.append("above EMA50")
 
-        elif rsi_value < 25:
-            reasons.append("RSI is oversold")
+            elif price < ema50_value:
+                score -= 1
+                reasons.append("below EMA50")
 
-    # ========================================================
-    # DECISION
-    # ========================================================
+        if rsi_value is not None:
 
-    decision = "WAIT"
+            if 55 <= rsi_value <= 70:
+                score += 1
+                reasons.append("RSI bullish zone")
 
-    if score >= 7:
-        decision = "BUY SIDE"
+            elif 30 <= rsi_value <= 45:
+                score -= 1
+                reasons.append("RSI bearish zone")
 
-    elif score <= -7:
-        decision = "SELL SIDE"
+            elif rsi_value > 75:
+                reasons.append("RSI overbought")
 
-    # Strong higher-timeframe conflict = WAIT
-    if (
-        trend_1d != "WAIT"
-        and trend_1h != "WAIT"
-        and trend_1d != trend_1h
-    ):
+            elif rsi_value < 25:
+                reasons.append("RSI oversold")
+
+        # ====================================================
+        # DECISION
+        # ====================================================
+
         decision = "WAIT"
-        reasons.append("1D and 1H trend conflict")
 
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
+        if score >= 7:
+            decision = "BUY SIDE"
 
-    confidence = min(95, 50 + abs(score) * 4)
+        elif score <= -7:
+            decision = "SELL SIDE"
 
-    if decision == "WAIT":
-        confidence = min(confidence, 60)
+        if (
+            trend_1d != "WAIT"
+            and trend_1h != "WAIT"
+            and trend_1d != trend_1h
+        ):
+            decision = "WAIT"
+            reasons.append("1D/1H conflict")
 
-    # ========================================================
-    # TRADE LEVELS
-    # ========================================================
+        # ====================================================
+        # CONFIDENCE
+        # ====================================================
 
-    entry = price
-    invalidation = None
-    target = None
+        confidence = min(
+            95,
+            50 + abs(score) * 4
+        )
 
-    if decision == "BUY SIDE":
+        if decision == "WAIT":
+            confidence = min(confidence, 60)
 
-        # Long invalidation below market
-        invalidation = buy_liquidity
+        # ====================================================
+        # LEVELS
+        # ====================================================
 
-        # Long target above market
-        target = sell_liquidity
+        entry = price
+        invalidation = None
+        target = None
 
-    elif decision == "SELL SIDE":
+        if decision == "BUY SIDE":
 
-        # Short invalidation above market
-        invalidation = sell_liquidity
+            invalidation = buy_liquidity
+            target = sell_liquidity
 
-        # Short target below market
-        target = buy_liquidity
+            if invalidation is not None and invalidation >= price:
+                invalidation = None
 
-    # Prevent nonsensical levels
-    if decision == "BUY SIDE":
+            if target is not None and target <= price:
+                target = None
 
-        if invalidation is not None and invalidation >= price:
-            invalidation = None
+        elif decision == "SELL SIDE":
 
-        if target is not None and target <= price:
-            target = None
+            invalidation = sell_liquidity
+            target = buy_liquidity
 
-    elif decision == "SELL SIDE":
+            if invalidation is not None and invalidation <= price:
+                invalidation = None
 
-        if invalidation is not None and invalidation <= price:
-            invalidation = None
+            if target is not None and target >= price:
+                target = None
 
-        if target is not None and target >= price:
-            target = None
+        if reasons:
+            why = " • ".join(reasons[:7])
+        else:
+            why = "Waiting for stronger market alignment"
 
-    # ========================================================
-    # HUMAN-READABLE WHY
-    # ========================================================
+        # ====================================================
+        # UPDATE ANALYSIS
+        # ====================================================
 
-    if reasons:
-        why = " • ".join(reasons[:6])
-    else:
-        why = "Waiting for stronger market alignment"
+        with lock:
 
-    # ========================================================
-    # UPDATE STATE
-    # ========================================================
+            latest["gold"].update({
 
-    with lock:
+                "price": round(price, 5),
 
-        latest["gold"].update({
-            "price": round(price, 5),
-            "status": "live",
-            "updated": datetime.now(timezone.utc).isoformat(),
+                "status": "live",
 
-            "decision": decision,
-            "confidence": confidence,
-            "score": score,
+                "updated": datetime.now(
+                    timezone.utc
+                ).isoformat(),
 
-            "entry": round(entry, 5) if entry is not None else "--",
-            "invalidation": (
-                round(invalidation, 5)
-                if invalidation is not None
-                else "--"
-            ),
-            "target": (
-                round(target, 5)
-                if target is not None
-                else "--"
-            ),
+                "decision": decision,
 
-            "why": why,
+                "confidence": confidence,
 
-            "trend": trend_1h,
-            "momentum": momentum_5m,
-            "structure": structure_5m,
+                "score": score,
 
-            "trend_5m": trend_5m,
-            "trend_15m": trend_15m,
-            "trend_1h": trend_1h,
-            "trend_1d": trend_1d,
+                "entry": (
+                    round(entry, 5)
+                    if entry is not None
+                    else "--"
+                ),
 
-            "rsi": (
-                round(rsi_value, 2)
-                if rsi_value is not None
-                else None
-            ),
+                "invalidation": (
+                    round(invalidation, 5)
+                    if invalidation is not None
+                    else "--"
+                ),
 
-            "ema20": (
-                round(ema20_value, 5)
-                if ema20_value is not None
-                else None
-            ),
+                "target": (
+                    round(target, 5)
+                    if target is not None
+                    else "--"
+                ),
 
-            "ema50": (
-                round(ema50_value, 5)
-                if ema50_value is not None
-                else None
-            ),
+                "why": why,
 
-            "buy_liquidity": (
-                round(buy_liquidity, 5)
-                if buy_liquidity is not None
-                else None
-            ),
+                "trend": trend_1h,
 
-            "sell_liquidity": (
-                round(sell_liquidity, 5)
-                if sell_liquidity is not None
-                else None
-            ),
+                "momentum": momentum,
 
-            "candles_5m": len(data_5m),
-            "candles_15m": len(data_15m),
-            "candles_1h": len(data_1h),
-            "candles_1d": len(data_1d)
-        })
+                "structure": structure,
+
+                "trend_5m": trend_5m,
+
+                "trend_15m": trend_15m,
+
+                "trend_1h": trend_1h,
+
+                "trend_1d": trend_1d,
+
+                "rsi": (
+                    round(rsi_value, 2)
+                    if rsi_value is not None
+                    else None
+                ),
+
+                "ema20": (
+                    round(ema20_value, 5)
+                    if ema20_value is not None
+                    else None
+                ),
+
+                "ema50": (
+                    round(ema50_value, 5)
+                    if ema50_value is not None
+                    else None
+                ),
+
+                "buy_liquidity": (
+                    round(buy_liquidity, 5)
+                    if buy_liquidity is not None
+                    else None
+                ),
+
+                "sell_liquidity": (
+                    round(sell_liquidity, 5)
+                    if sell_liquidity is not None
+                    else None
+                ),
+
+                "candles_5m": len(data_5m),
+
+                "candles_15m": len(data_15m),
+
+                "candles_1h": len(data_1h),
+
+                "candles_1d": len(data_1d)
+            })
+
+        print(
+            f"AI UPDATE: price={price} "
+            f"score={score} "
+            f"decision={decision}",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "ANALYSIS ERROR:",
+            repr(e),
+            flush=True
+        )
+
+        # Even if analysis fails,
+        # keep live price visible.
+
+        if live_price is not None:
+
+            with lock:
+                latest["gold"]["price"] = round(
+                    float(live_price),
+                    5
+                )
+
+                latest["gold"]["status"] = "live"
+
+                latest["gold"]["updated"] = (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                )
 
 
 # ============================================================
-# TWELVE DATA CANDLES
+# CANDLE FETCH
 # ============================================================
 
 def fetch_candles(interval):
@@ -564,14 +643,17 @@ def fetch_candles(interval):
             timeout=20
         )
 
-        if response.status_code != 200:
+        print(
+            f"CANDLE REQUEST {interval}: HTTP "
+            f"{response.status_code}",
+            flush=True
+        )
 
+        if response.status_code != 200:
             print(
-                f"CANDLE {interval}: HTTP {response.status_code} "
-                f"{response.text[:250]}",
+                response.text[:250],
                 flush=True
             )
-
             return
 
         data = response.json()
@@ -579,15 +661,16 @@ def fetch_candles(interval):
         if "values" not in data:
 
             print(
-                f"CANDLE {interval}: no values {data}",
+                f"CANDLE {interval}: no values",
+                data,
                 flush=True
             )
 
             return
 
-        values = data["values"]
-
-        values = list(reversed(values))
+        values = list(
+            reversed(data["values"])
+        )
 
         with lock:
             candles[interval] = values
@@ -597,12 +680,17 @@ def fetch_candles(interval):
             flush=True
         )
 
-        calculate_analysis()
+        # Recalculate using current live price
+        with lock:
+            current_price = latest["gold"]["price"]
+
+        calculate_analysis(current_price)
 
     except Exception as e:
 
         print(
-            f"CANDLE ERROR {interval}: {e}",
+            f"CANDLE ERROR {interval}:",
+            repr(e),
             flush=True
         )
 
@@ -613,7 +701,10 @@ def fetch_candles(interval):
 
 def candle_worker():
 
-    print("CANDLE ENGINE STARTING", flush=True)
+    print(
+        "CANDLE ENGINE STARTING",
+        flush=True
+    )
 
     last_run = {
         "5min": 0,
@@ -622,11 +713,14 @@ def candle_worker():
         "1day": 0
     }
 
+    # Deliberately spaced out to avoid
+    # Twelve Data Basic credit bursts.
+
     intervals = {
-        "5min": 60,
-        "15min": 180,
-        "1h": 300,
-        "1day": 900
+        "5min": 120,
+        "15min": 300,
+        "1h": 600,
+        "1day": 1800
     }
 
     while True:
@@ -641,16 +735,22 @@ def candle_worker():
 
                 last_run[interval] = now
 
+                # Small spacing between API requests
+                time.sleep(2)
+
         time.sleep(5)
 
 
 # ============================================================
-# GOLD WEBSOCKET ENGINE
+# GOLD WEBSOCKET
 # ============================================================
 
 def gold_worker():
 
-    print("GOLD WEBSOCKET ENGINE STARTING", flush=True)
+    print(
+        "GOLD WEBSOCKET ENGINE STARTING",
+        flush=True
+    )
 
     if not API_KEY:
 
@@ -672,14 +772,20 @@ def gold_worker():
                 f"?apikey={API_KEY}"
             )
 
-            print("GOLD WS CONNECTING", flush=True)
+            print(
+                "GOLD WS CONNECTING",
+                flush=True
+            )
 
             ws = websocket.create_connection(
                 ws_url,
                 timeout=30
             )
 
-            print("GOLD WS OPEN", flush=True)
+            print(
+                "GOLD WS OPEN",
+                flush=True
+            )
 
             subscribe_message = {
                 "action": "subscribe",
@@ -688,7 +794,11 @@ def gold_worker():
                 }
             }
 
-            ws.send(json.dumps(subscribe_message))
+            ws.send(
+                json.dumps(
+                    subscribe_message
+                )
+            )
 
             print(
                 "GOLD WS SUBSCRIBED:",
@@ -701,10 +811,6 @@ def gold_worker():
                 raw = ws.recv()
 
                 if not raw:
-                    print(
-                        "GOLD WS EMPTY MESSAGE",
-                        flush=True
-                    )
                     break
 
                 try:
@@ -722,31 +828,33 @@ def gold_worker():
 
                 if isinstance(data, dict):
 
-                    # Normal Twelve Data price message
                     price = to_float(
                         data.get("price")
                     )
 
-                    # Some responses can contain values differently
                     if price is None:
-
                         price = to_float(
                             data.get("close")
                         )
 
-                if price is not None:
+                if price is None:
+                    continue
 
-                    with lock:
-                        gold_prices.append(price)
+                print(
+                    "GOLD PRICE:",
+                    price,
+                    flush=True
+                )
 
-                    print(
-                        "GOLD PRICE:",
-                        price,
-                        flush=True
-                    )
+                # ==================================================
+                # CRITICAL:
+                # Update API state FIRST.
+                # ==================================================
 
-                    # Analyze immediately from live price
-                    calculate_analysis(price)
+                update_live_price(price)
+
+                # Then calculate analysis.
+                calculate_analysis(price)
 
         except Exception as e:
 
@@ -775,7 +883,7 @@ def gold_worker():
 
 
 # ============================================================
-# API
+# API ROUTES
 # ============================================================
 
 @app.route("/")
@@ -788,8 +896,11 @@ def home():
 def api_state():
 
     with lock:
+
         result = {
-            "gold": dict(latest["gold"])
+            "gold": dict(
+                latest["gold"]
+            )
         }
 
     return jsonify(result)
@@ -858,6 +969,11 @@ body {
 
 .waiting {
     color: #f2c94c;
+    font-weight: bold;
+}
+
+.error {
+    color: #ff6b6b;
     font-weight: bold;
 }
 
@@ -952,81 +1068,38 @@ WAIT
 <div class="grid">
 
 <div class="box">
-
-<div class="label">
-CONFIDENCE
-</div>
-
-<div id="confidence" class="value">
-0%
-</div>
-
+<div class="label">CONFIDENCE</div>
+<div id="confidence" class="value">0%</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-AI SCORE
-</div>
-
-<div id="score" class="value">
-0
-</div>
-
+<div class="label">AI SCORE</div>
+<div id="score" class="value">0</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-ENTRY
-</div>
-
-<div id="entry" class="value">
---
-</div>
-
+<div class="label">ENTRY</div>
+<div id="entry" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-INVALIDATION
-</div>
-
-<div id="invalidation" class="value">
---
-</div>
-
+<div class="label">INVALIDATION</div>
+<div id="invalidation" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-TARGET LIQUIDITY
-</div>
-
-<div id="target" class="value">
---
-</div>
-
+<div class="label">TARGET LIQUIDITY</div>
+<div id="target" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-RSI
-</div>
-
-<div id="rsi" class="value">
---
+<div class="label">RSI</div>
+<div id="rsi" class="value">--</div>
 </div>
 
 </div>
 
 </div>
-
-</div>
-
 
 <div class="card">
 
@@ -1060,7 +1133,6 @@ MARKET STRUCTURE
 
 </div>
 
-
 <div class="card">
 
 <div class="label">
@@ -1075,7 +1147,6 @@ Waiting for live market data...
 
 </div>
 
-
 <script>
 
 async function updateState() {
@@ -1083,12 +1154,21 @@ async function updateState() {
     try {
 
         const response = await fetch(
-            "/api/state?t=" + Date.now()
+            "/api/state?t=" + Date.now(),
+            {
+                cache: "no-store"
+            }
         );
+
+        if (!response.ok) {
+            throw new Error(
+                "HTTP " + response.status
+            );
+        }
 
         const data = await response.json();
 
-        const gold = data.gold;
+        const gold = data.gold || {};
 
         document.getElementById("price").innerText =
             gold.price ?? "--";
@@ -1129,7 +1209,6 @@ async function updateState() {
         document.getElementById("why").innerText =
             gold.why ?? "Waiting...";
 
-
         const connection =
             document.getElementById("connection");
 
@@ -1148,36 +1227,48 @@ async function updateState() {
             connection.className = "waiting";
         }
 
-
-        const decision =
+        const decisionElement =
             document.getElementById("decision");
 
         if (gold.decision === "BUY SIDE") {
 
-            decision.style.color = "#45e58c";
+            decisionElement.style.color =
+                "#45e58c";
 
-        } else if (gold.decision === "SELL SIDE") {
+        } else if (
+            gold.decision === "SELL SIDE"
+        ) {
 
-            decision.style.color = "#ff6b6b";
+            decisionElement.style.color =
+                "#ff6b6b";
 
         } else {
 
-            decision.style.color = "#f2c94c";
+            decisionElement.style.color =
+                "#f2c94c";
         }
 
     } catch (error) {
 
-        document.getElementById("connection").innerText =
+        const connection =
+            document.getElementById("connection");
+
+        connection.innerText =
             "CONNECTION ERROR";
 
-    }
+        connection.className = "error";
 
+        console.error(error);
+    }
 }
 
 
-setInterval(updateState, 1000);
-
 updateState();
+
+setInterval(
+    updateState,
+    1000
+);
 
 </script>
 
@@ -1191,7 +1282,10 @@ updateState();
 # START ENGINES
 # ============================================================
 
-print("LIVE ENGINE STARTING", flush=True)
+print(
+    "LIVE ENGINE STARTING",
+    flush=True
+)
 
 threading.Thread(
     target=gold_worker,
@@ -1203,7 +1297,10 @@ threading.Thread(
     daemon=True
 ).start()
 
-print("LIVE ENGINE STARTED", flush=True)
+print(
+    "LIVE ENGINE STARTED",
+    flush=True
+)
 
 
 # ============================================================
@@ -1214,6 +1311,11 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
+        port=int(
+            os.environ.get(
+                "PORT",
+                5000
+            )
+        ),
         debug=False
     )
