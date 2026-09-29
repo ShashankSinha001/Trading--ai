@@ -28,8 +28,28 @@ clients = []
 clients_lock = threading.Lock()
 state_lock = threading.Lock()
 engine_lock = threading.Lock()
+candle_lock = threading.Lock()
 
 engine_started = False
+
+
+# =========================================================
+# CANDLE DATA
+# =========================================================
+
+CANDLE_INTERVALS = {
+    "5M": "5min",
+    "15M": "15min",
+    "1H": "1h",
+    "1D": "1day"
+}
+
+candle_data = {
+    "5M": [],
+    "15M": [],
+    "1H": [],
+    "1D": []
+}
 
 
 # =========================================================
@@ -55,70 +75,44 @@ def broadcast(data):
 
 
 # =========================================================
-# ANALYSIS ENGINE
+# EMA
 # =========================================================
 
-def calculate_analysis():
+def calculate_ema(values, period):
 
-    with state_lock:
+    if not values:
+        return None
 
-        prices = list(history)
+    if len(values) < period:
+        return sum(values) / len(values)
 
-    if len(prices) < 10:
+    multiplier = 2 / (period + 1)
 
-        return {
-            "trend": "CALCULATING",
-            "momentum": "CALCULATING",
-            "structure": "BUILDING DATA",
-            "support": None,
-            "resistance": None,
-            "ema20": None,
-            "ema50": None,
-            "rsi": None,
-            "signal": "WAIT",
-            "confidence": 0,
-            "summary": "Collecting market data..."
-        }
+    value = sum(values[:period]) / period
 
-    recent = prices[-100:]
+    for price in values[period:]:
+        value = (
+            (price - value) * multiplier
+            + value
+        )
 
-    # -------------------------
-    # EMA
-    # -------------------------
-
-    def ema(values, period):
-
-        if len(values) < period:
-            return sum(values) / len(values)
-
-        multiplier = 2 / (period + 1)
-
-        value = sum(values[:period]) / period
-
-        for price in values[period:]:
-
-            value = (
-                (price - value) * multiplier
-                + value
-            )
-
-        return value
-
-    ema20 = ema(recent, 20)
-
-    ema50 = ema(recent, 50)
+    return value
 
 
-    # -------------------------
-    # RSI
-    # -------------------------
+# =========================================================
+# RSI
+# =========================================================
+
+def calculate_rsi(values):
+
+    if len(values) < 2:
+        return None
 
     changes = []
 
-    for i in range(1, len(recent)):
-
+    for i in range(1, len(values)):
         changes.append(
-            recent[i] - recent[i - 1]
+            values[i] - values[i - 1]
         )
 
     gains = [
@@ -143,31 +137,835 @@ def calculate_analysis():
 
     if avg_loss == 0:
 
-        rsi = 100
+        if avg_gain == 0:
+            return 50
 
-    else:
+        return 100
 
-        rs = avg_gain / avg_loss
+    rs = avg_gain / avg_loss
 
-        rsi = 100 - (
-            100 / (1 + rs)
+    return 100 - (
+        100 / (1 + rs)
+    )
+
+
+# =========================================================
+# FETCH CANDLES
+# =========================================================
+
+def fetch_candles(interval, outputsize=200):
+
+    if not API_KEY:
+        return []
+
+    try:
+
+        url = (
+            "https://api.twelvedata.com/time_series"
         )
 
+        params = {
+            "symbol": "XAU/USD",
+            "interval": interval,
+            "outputsize": outputsize,
+            "order": "asc",
+            "timezone": "UTC",
+            "apikey": API_KEY
+        }
 
-    # -------------------------
-    # SUPPORT / RESISTANCE
-    # -------------------------
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15
+        )
 
-    support = min(recent)
+        data = response.json()
 
-    resistance = max(recent)
+        if data.get("status") == "error":
+
+            print(
+                "CANDLE API ERROR:",
+                data,
+                flush=True
+            )
+
+            return []
+
+        values = data.get(
+            "values",
+            []
+        )
+
+        candles = []
+
+        for row in values:
+
+            try:
+
+                candles.append({
+
+                    "datetime":
+                        row.get("datetime"),
+
+                    "open":
+                        float(row.get("open")),
+
+                    "high":
+                        float(row.get("high")),
+
+                    "low":
+                        float(row.get("low")),
+
+                    "close":
+                        float(row.get("close"))
+
+                })
+
+            except Exception:
+                continue
+
+        return candles
+
+    except Exception as error:
+
+        print(
+            "CANDLE FETCH ERROR:",
+            error,
+            flush=True
+        )
+
+        return []
+
+
+# =========================================================
+# UPDATE CANDLES
+# =========================================================
+
+def update_all_candles():
+
+    for name, interval in CANDLE_INTERVALS.items():
+
+        candles = fetch_candles(
+            interval,
+            200
+        )
+
+        if candles:
+
+            with candle_lock:
+
+                candle_data[name] = candles
+
+            print(
+                "CANDLES:",
+                name,
+                len(candles),
+                flush=True
+            )
+
+
+# =========================================================
+# CANDLE WORKER
+# =========================================================
+
+def candle_worker():
+
+    print(
+        "CANDLE ENGINE STARTING",
+        flush=True
+    )
+
+    while True:
+
+        try:
+
+            update_all_candles()
+
+            time.sleep(60)
+
+        except Exception as error:
+
+            print(
+                "CANDLE ENGINE ERROR:",
+                error,
+                flush=True
+            )
+
+            time.sleep(10)
+
+
+# =========================================================
+# SWING DETECTION
+# =========================================================
+
+def find_swing_highs(candles, lookback=2):
+
+    highs = []
+
+    if len(candles) < (
+        lookback * 2 + 1
+    ):
+        return highs
+
+    for i in range(
+        lookback,
+        len(candles) - lookback
+    ):
+
+        current = candles[i]["high"]
+
+        left = [
+            candles[j]["high"]
+            for j in range(
+                i - lookback,
+                i
+            )
+        ]
+
+        right = [
+            candles[j]["high"]
+            for j in range(
+                i + 1,
+                i + lookback + 1
+            )
+        ]
+
+        if (
+            current >= max(left)
+            and
+            current >= max(right)
+        ):
+
+            highs.append({
+                "price": current,
+                "datetime":
+                    candles[i]["datetime"]
+            })
+
+    return highs
+
+
+def find_swing_lows(candles, lookback=2):
+
+    lows = []
+
+    if len(candles) < (
+        lookback * 2 + 1
+    ):
+        return lows
+
+    for i in range(
+        lookback,
+        len(candles) - lookback
+    ):
+
+        current = candles[i]["low"]
+
+        left = [
+            candles[j]["low"]
+            for j in range(
+                i - lookback,
+                i
+            )
+        ]
+
+        right = [
+            candles[j]["low"]
+            for j in range(
+                i + 1,
+                i + lookback + 1
+            )
+        ]
+
+        if (
+            current <= min(left)
+            and
+            current <= min(right)
+        ):
+
+            lows.append({
+                "price": current,
+                "datetime":
+                    candles[i]["datetime"]
+            })
+
+    return lows
+
+
+# =========================================================
+# EQUAL HIGH / LOW DETECTION
+# =========================================================
+
+def detect_equal_levels(
+    levels,
+    tolerance=0.15
+):
+
+    groups = []
+
+    for level in levels:
+
+        price = level["price"]
+
+        matched = False
+
+        for group in groups:
+
+            if abs(
+                price - group["price"]
+            ) <= tolerance:
+
+                group["members"].append(
+                    level
+                )
+
+                group["price"] = (
+                    sum(
+                        x["price"]
+                        for x in group["members"]
+                    )
+                    /
+                    len(group["members"])
+                )
+
+                matched = True
+
+                break
+
+        if not matched:
+
+            groups.append({
+
+                "price": price,
+
+                "members": [level]
+
+            })
+
+    result = []
+
+    for group in groups:
+
+        if len(group["members"]) >= 2:
+
+            result.append({
+
+                "price":
+                    round(
+                        group["price"],
+                        3
+                    ),
+
+                "strength":
+                    min(
+                        100,
+                        50 +
+                        (
+                            len(
+                                group["members"]
+                            ) * 15
+                        )
+                    ),
+
+                "type":
+                    "EQUAL LEVEL"
+
+            })
+
+    return result
+
+
+# =========================================================
+# LIQUIDITY ANALYSIS
+# =========================================================
+
+def calculate_liquidity():
+
+    with candle_lock:
+
+        candles = {
+            key: list(value)
+            for key, value
+            in candle_data.items()
+        }
+
+    with state_lock:
+
+        current = latest["gold"]["price"]
+
+    result = {
+
+        "current_price": current,
+
+        "1D": {
+            "buy_side": [],
+            "sell_side": [],
+            "previous_day_high": None,
+            "previous_day_low": None
+        },
+
+        "1H": {
+            "buy_side": [],
+            "sell_side": []
+        },
+
+        "15M": {
+            "buy_side": [],
+            "sell_side": []
+        },
+
+        "5M": {
+            "buy_side": [],
+            "sell_side": []
+        },
+
+        "nearest_above": None,
+        "nearest_below": None,
+
+        "nearest_above_distance": None,
+        "nearest_below_distance": None
+    }
+
+    if not current:
+        return result
+
+    # -----------------------------------------------------
+    # 1D PREVIOUS DAY HIGH / LOW
+    # -----------------------------------------------------
+
+    daily = candles.get(
+        "1D",
+        []
+    )
+
+    if len(daily) >= 2:
+
+        previous_day = daily[-2]
+
+        pdh = previous_day["high"]
+        pdl = previous_day["low"]
+
+        result["1D"][
+            "previous_day_high"
+        ] = round(pdh, 3)
+
+        result["1D"][
+            "previous_day_low"
+        ] = round(pdl, 3)
+
+        if pdh > current:
+
+            result["1D"][
+                "buy_side"
+            ].append({
+
+                "price": round(
+                    pdh,
+                    3
+                ),
+
+                "type":
+                    "PREVIOUS DAY HIGH",
+
+                "strength": 90
+
+            })
+
+        if pdl < current:
+
+            result["1D"][
+                "sell_side"
+            ].append({
+
+                "price": round(
+                    pdl,
+                    3
+                ),
+
+                "type":
+                    "PREVIOUS DAY LOW",
+
+                "strength": 90
+
+            })
+
+    # -----------------------------------------------------
+    # TIMEFRAME SWINGS
+    # -----------------------------------------------------
+
+    for timeframe in [
+        "1H",
+        "15M",
+        "5M"
+    ]:
+
+        data = candles.get(
+            timeframe,
+            []
+        )
+
+        if len(data) < 7:
+            continue
+
+        recent = data[-100:]
+
+        swing_highs = find_swing_highs(
+            recent,
+            2
+        )
+
+        swing_lows = find_swing_lows(
+            recent,
+            2
+        )
+
+        # -------------------------
+        # BUY SIDE
+        # -------------------------
+
+        for level in swing_highs[-10:]:
+
+            price = level["price"]
+
+            if price > current:
+
+                result[timeframe][
+                    "buy_side"
+                ].append({
+
+                    "price":
+                        round(
+                            price,
+                            3
+                        ),
+
+                    "type":
+                        "SWING HIGH",
+
+                    "strength":
+                        70
+
+                })
+
+        # -------------------------
+        # SELL SIDE
+        # -------------------------
+
+        for level in swing_lows[-10:]:
+
+            price = level["price"]
+
+            if price < current:
+
+                result[timeframe][
+                    "sell_side"
+                ].append({
+
+                    "price":
+                        round(
+                            price,
+                            3
+                        ),
+
+                    "type":
+                        "SWING LOW",
+
+                    "strength":
+                        70
+
+                })
+
+        # -------------------------
+        # EQUAL HIGHS
+        # -------------------------
+
+        equal_highs = detect_equal_levels(
+            swing_highs,
+            0.15
+        )
+
+        for level in equal_highs:
+
+            if level["price"] > current:
+
+                result[timeframe][
+                    "buy_side"
+                ].append({
+
+                    "price":
+                        level["price"],
+
+                    "type":
+                        "EQUAL HIGHS",
+
+                    "strength":
+                        level["strength"]
+
+                })
+
+        # -------------------------
+        # EQUAL LOWS
+        # -------------------------
+
+        equal_lows = detect_equal_levels(
+            swing_lows,
+            0.15
+        )
+
+        for level in equal_lows:
+
+            if level["price"] < current:
+
+                result[timeframe][
+                    "sell_side"
+                ].append({
+
+                    "price":
+                        level["price"],
+
+                    "type":
+                        "EQUAL LOWS",
+
+                    "strength":
+                        level["strength"]
+
+                })
+
+    # -----------------------------------------------------
+    # SORT LEVELS
+    # -----------------------------------------------------
+
+    for timeframe in result:
+
+        if timeframe in [
+            "1D",
+            "1H",
+            "15M",
+            "5M"
+        ]:
+
+            result[timeframe][
+                "buy_side"
+            ] = sorted(
+                result[timeframe][
+                    "buy_side"
+                ],
+                key=lambda x: x["price"]
+            )
+
+            result[timeframe][
+                "sell_side"
+            ] = sorted(
+                result[timeframe][
+                    "sell_side"
+                ],
+                key=lambda x: x["price"],
+                reverse=True
+            )
+
+    # -----------------------------------------------------
+    # NEAREST LIQUIDITY
+    # -----------------------------------------------------
+
+    above = []
+    below = []
+
+    for timeframe in [
+        "1D",
+        "1H",
+        "15M",
+        "5M"
+    ]:
+
+        for level in result[
+            timeframe
+        ]["buy_side"]:
+
+            if level["price"] > current:
+
+                above.append(
+                    level["price"]
+                )
+
+        for level in result[
+            timeframe
+        ]["sell_side"]:
+
+            if level["price"] < current:
+
+                below.append(
+                    level["price"]
+                )
+
+    if above:
+
+        nearest = min(above)
+
+        result["nearest_above"] = nearest
+
+        result[
+            "nearest_above_distance"
+        ] = round(
+            nearest - current,
+            3
+        )
+
+    if below:
+
+        nearest = max(below)
+
+        result["nearest_below"] = nearest
+
+        result[
+            "nearest_below_distance"
+        ] = round(
+            current - nearest,
+            3
+        )
+
+    return result
+
+
+# =========================================================
+# LIQUIDITY SWEEP DETECTION
+# =========================================================
+
+def detect_liquidity_sweeps():
+
+    with candle_lock:
+
+        candles = {
+            key: list(value)
+            for key, value
+            in candle_data.items()
+        }
+
+    result = {
+        "5M": "NONE",
+        "15M": "NONE",
+        "1H": "NONE",
+        "1D": "NONE"
+    }
+
+    for timeframe in [
+        "5M",
+        "15M",
+        "1H",
+        "1D"
+    ]:
+
+        data = candles.get(
+            timeframe,
+            []
+        )
+
+        if len(data) < 5:
+            continue
+
+        recent = data[-5:]
+
+        previous = data[-2]
+
+        latest_candle = data[-1]
+
+        previous_high = previous["high"]
+        previous_low = previous["low"]
+
+        latest_high = latest_candle["high"]
+        latest_low = latest_candle["low"]
+        latest_close = latest_candle["close"]
+
+        if (
+            latest_high > previous_high
+            and
+            latest_close < previous_high
+        ):
+
+            result[timeframe] = (
+                "BUY-SIDE LIQUIDITY SWEPT"
+            )
+
+        elif (
+            latest_low < previous_low
+            and
+            latest_close > previous_low
+        ):
+
+            result[timeframe] = (
+                "SELL-SIDE LIQUIDITY SWEPT"
+            )
+
+    return result
+
+
+# =========================================================
+# ANALYSIS ENGINE
+# =========================================================
+
+def calculate_analysis():
+
+    with state_lock:
+
+        prices = list(history)
+
+    if len(prices) < 10:
+
+        return {
+
+            "trend": "CALCULATING",
+
+            "momentum": "CALCULATING",
+
+            "structure": "BUILDING DATA",
+
+            "support": None,
+
+            "resistance": None,
+
+            "ema20": None,
+
+            "ema50": None,
+
+            "rsi": None,
+
+            "signal": "WAIT",
+
+            "confidence": 0,
+
+            "summary":
+                "Collecting market data..."
+
+        }
+
+    recent = prices[-100:]
+
+    ema20 = calculate_ema(
+        recent,
+        20
+    )
+
+    ema50 = calculate_ema(
+        recent,
+        50
+    )
+
+    rsi = calculate_rsi(
+        recent
+    )
+
+    support = min(
+        recent
+    )
+
+    resistance = max(
+        recent
+    )
 
     current = recent[-1]
 
-
-    # -------------------------
+    # -----------------------------------------------------
     # TREND
-    # -------------------------
+    # -----------------------------------------------------
 
     if current > ema20 > ema50:
 
@@ -181,10 +979,9 @@ def calculate_analysis():
 
         trend = "SIDEWAYS"
 
-
-    # -------------------------
+    # -----------------------------------------------------
     # MOMENTUM
-    # -------------------------
+    # -----------------------------------------------------
 
     if rsi >= 60:
 
@@ -206,15 +1003,19 @@ def calculate_analysis():
 
         momentum = "NEUTRAL"
 
-
-    # -------------------------
-    # MARKET STRUCTURE
-    # -------------------------
+    # -----------------------------------------------------
+    # STRUCTURE
+    # -----------------------------------------------------
 
     if len(recent) >= 10:
 
-        old = sum(recent[-10:-5]) / 5
-        new = sum(recent[-5:]) / 5
+        old = sum(
+            recent[-10:-5]
+        ) / 5
+
+        new = sum(
+            recent[-5:]
+        ) / 5
 
         if new > old:
 
@@ -232,10 +1033,17 @@ def calculate_analysis():
 
         structure = "BUILDING"
 
+    # -----------------------------------------------------
+    # LIQUIDITY
+    # -----------------------------------------------------
 
-    # -------------------------
-    # SIGNAL
-    # -------------------------
+    liquidity = calculate_liquidity()
+
+    sweeps = detect_liquidity_sweeps()
+
+    # -----------------------------------------------------
+    # SCORE
+    # -----------------------------------------------------
 
     score = 0
 
@@ -244,7 +1052,6 @@ def calculate_analysis():
 
     elif trend == "BEARISH":
         score -= 2
-
 
     if momentum == "STRONG BUYING":
         score += 2
@@ -258,46 +1065,58 @@ def calculate_analysis():
     elif momentum == "SELLING":
         score -= 1
 
-
     if structure == "HIGHER":
         score += 1
 
     elif structure == "LOWER":
         score -= 1
 
+    # -----------------------------------------------------
+    # SIGNAL
+    # -----------------------------------------------------
 
     if score >= 4:
 
         signal = "BUY"
-        confidence = min(90, 60 + score * 5)
+
+        confidence = min(
+            90,
+            60 + score * 5
+        )
 
     elif score <= -4:
 
         signal = "SELL"
-        confidence = min(90, 60 + abs(score) * 5)
+
+        confidence = min(
+            90,
+            60 + abs(score) * 5
+        )
 
     else:
 
         signal = "WAIT"
+
         confidence = 50
 
-
-    # -------------------------
+    # -----------------------------------------------------
     # SUMMARY
-    # -------------------------
+    # -----------------------------------------------------
 
     if signal == "BUY":
 
         summary = (
-            "Buying pressure is currently stronger "
-            "than selling pressure."
+            "Buying pressure is stronger. "
+            "Wait for liquidity and structure "
+            "confirmation before acting."
         )
 
     elif signal == "SELL":
 
         summary = (
-            "Selling pressure is currently stronger "
-            "than buying pressure."
+            "Selling pressure is stronger. "
+            "Wait for liquidity and structure "
+            "confirmation before acting."
         )
 
     else:
@@ -307,45 +1126,61 @@ def calculate_analysis():
             "Waiting for stronger confirmation."
         )
 
-
     return {
 
-        "trend": trend,
+        "trend":
+            trend,
 
-        "momentum": momentum,
+        "momentum":
+            momentum,
 
-        "structure": structure,
+        "structure":
+            structure,
 
-        "support": round(
-            support,
-            3
-        ),
+        "support":
+            round(
+                support,
+                3
+            ),
 
-        "resistance": round(
-            resistance,
-            3
-        ),
+        "resistance":
+            round(
+                resistance,
+                3
+            ),
 
-        "ema20": round(
-            ema20,
-            3
-        ),
+        "ema20":
+            round(
+                ema20,
+                3
+            ),
 
-        "ema50": round(
-            ema50,
-            3
-        ),
+        "ema50":
+            round(
+                ema50,
+                3
+            ),
 
-        "rsi": round(
-            rsi,
-            2
-        ),
+        "rsi":
+            round(
+                rsi,
+                2
+            ),
 
-        "signal": signal,
+        "signal":
+            signal,
 
-        "confidence": confidence,
+        "confidence":
+            confidence,
 
-        "summary": summary
+        "summary":
+            summary,
+
+        "liquidity":
+            liquidity,
+
+        "sweeps":
+            sweeps
     }
 
 
@@ -358,6 +1193,7 @@ def update_gold(price):
     with state_lock:
 
         latest["gold"]["price"] = price
+
         latest["gold"]["status"] = "LIVE"
 
         history.append(price)
@@ -370,13 +1206,18 @@ def update_gold(price):
 
     broadcast({
 
-        "type": "gold_update",
+        "type":
+            "gold_update",
 
-        "price": price,
+        "price":
+            price,
 
-        "analysis": analysis,
+        "analysis":
+            analysis,
 
-        "timestamp": time.time()
+        "timestamp":
+            time.time()
+
     })
 
 
@@ -418,26 +1259,42 @@ def gold_worker():
 
                 subscribe = {
 
-                    "action": "subscribe",
+                    "action":
+                        "subscribe",
 
                     "params": {
-                        "symbols": "XAU/USD"
+                        "symbols":
+                            "XAU/USD"
                     }
+
                 }
 
                 ws.send(
-                    json.dumps(subscribe)
+                    json.dumps(
+                        subscribe
+                    )
                 )
 
-            def on_message(ws, message):
+            def on_message(
+                ws,
+                message
+            ):
 
                 try:
 
-                    data = json.loads(message)
+                    data = json.loads(
+                        message
+                    )
 
-                    if data.get("event") == "price":
+                    if (
+                        data.get("event")
+                        ==
+                        "price"
+                    ):
 
-                        price = data.get("price")
+                        price = data.get(
+                            "price"
+                        )
 
                         if price is not None:
 
@@ -451,9 +1308,11 @@ def gold_worker():
                                 float(price)
                             )
 
-                    elif data.get(
-                        "event"
-                    ) == "subscribe-status":
+                    elif (
+                        data.get("event")
+                        ==
+                        "subscribe-status"
+                    ):
 
                         print(
                             "GOLD SUBSCRIPTION:",
@@ -469,7 +1328,10 @@ def gold_worker():
                         flush=True
                     )
 
-            def on_error(ws, error):
+            def on_error(
+                ws,
+                error
+            ):
 
                 print(
                     "GOLD WEBSOCKET ERROR:",
@@ -477,7 +1339,11 @@ def gold_worker():
                     flush=True
                 )
 
-            def on_close(ws, code, message):
+            def on_close(
+                ws,
+                code,
+                message
+            ):
 
                 print(
                     "GOLD WEBSOCKET CLOSED:",
@@ -504,6 +1370,7 @@ def gold_worker():
                 ping_interval=20,
 
                 ping_timeout=10
+
             )
 
         except Exception as error:
@@ -540,7 +1407,6 @@ def start_live_engine():
     with engine_lock:
 
         if engine_started:
-
             return
 
         engine_started = True
@@ -552,6 +1418,11 @@ def start_live_engine():
 
         threading.Thread(
             target=oil_worker,
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=candle_worker,
             daemon=True
         ).start()
 
@@ -628,7 +1499,7 @@ body {
 
 .container {
 
-    max-width: 1100px;
+    max-width: 1150px;
 
     margin: auto;
 
@@ -756,6 +1627,144 @@ body {
     line-height: 1.5;
 }
 
+.section-title {
+
+    font-size: 22px;
+
+    font-weight: bold;
+
+    margin-top: 30px;
+
+    margin-bottom: 15px;
+}
+
+.liquidity-grid {
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(
+        auto-fit,
+        minmax(220px, 1fr)
+    );
+
+    gap: 15px;
+}
+
+.liquidity-card {
+
+    background: #111722;
+
+    border:
+    1px solid #202631;
+
+    border-radius: 14px;
+
+    padding: 18px;
+}
+
+.liquidity-card h3 {
+
+    margin-top: 0;
+
+    margin-bottom: 15px;
+
+    font-size: 18px;
+}
+
+.liquidity-row {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    gap: 10px;
+
+    padding: 8px 0;
+
+    border-bottom:
+    1px solid #202631;
+}
+
+.liquidity-row:last-child {
+
+    border-bottom: none;
+}
+
+.liquidity-label {
+
+    color: #8d96a5;
+
+    font-size: 12px;
+}
+
+.liquidity-price {
+
+    font-weight: bold;
+
+    font-size: 15px;
+}
+
+.buy {
+
+    color: #ff6b6b;
+}
+
+.sell {
+
+    color: #45e08b;
+}
+
+.nearest {
+
+    margin-top: 20px;
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(
+        auto-fit,
+        minmax(220px, 1fr)
+    );
+
+    gap: 15px;
+}
+
+.nearest-box {
+
+    background: #0b1018;
+
+    border:
+    1px solid #202631;
+
+    border-radius: 14px;
+
+    padding: 18px;
+}
+
+.sweep {
+
+    margin-top: 20px;
+
+    padding: 18px;
+
+    background: #111722;
+
+    border:
+    1px solid #202631;
+
+    border-radius: 14px;
+}
+
+.small {
+
+    color: #8d96a5;
+
+    font-size: 13px;
+
+    margin-top: 5px;
+}
+
 </style>
 
 </head>
@@ -797,115 +1806,43 @@ Connecting...
 <div class="analysis">
 
 <div class="box">
-
-<div class="label">
-Trend
-</div>
-
-<div
-id="trend"
-class="value">
---
-</div>
-
+<div class="label">Trend</div>
+<div id="trend" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-Momentum
-</div>
-
-<div
-id="momentum"
-class="value">
---
-</div>
-
+<div class="label">Momentum</div>
+<div id="momentum" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-Structure
-</div>
-
-<div
-id="structure"
-class="value">
---
-</div>
-
+<div class="label">Structure</div>
+<div id="structure" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-RSI
-</div>
-
-<div
-id="rsi"
-class="value">
---
-</div>
-
+<div class="label">RSI</div>
+<div id="rsi" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-EMA 20
-</div>
-
-<div
-id="ema20"
-class="value">
---
-</div>
-
+<div class="label">EMA 20</div>
+<div id="ema20" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-EMA 50
-</div>
-
-<div
-id="ema50"
-class="value">
---
-</div>
-
+<div class="label">EMA 50</div>
+<div id="ema50" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-Support
-</div>
-
-<div
-id="support"
-class="value">
---
-</div>
-
+<div class="label">Support</div>
+<div id="support" class="value">--</div>
 </div>
 
 <div class="box">
-
-<div class="label">
-Resistance
-</div>
-
-<div
-id="resistance"
-class="value">
---
-</div>
-
+<div class="label">Resistance</div>
+<div id="resistance" class="value">--</div>
 </div>
 
 </div>
@@ -939,14 +1876,247 @@ Collecting market data...
 </div>
 
 
+<!-- =====================================================
+     LIQUIDITY MAP
+===================================================== -->
+
+<div class="section-title">
+💧 Liquidity Map
+</div>
+
+<div class="liquidity-grid">
+
+<div class="liquidity-card">
+
+<h3>1D — Daily</h3>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+BUY-SIDE
+</span>
+
+<span
+id="dBuy"
+class="liquidity-price buy">
+--
+</span>
+
+</div>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+SELL-SIDE
+</span>
+
+<span
+id="dSell"
+class="liquidity-price sell">
+--
+</span>
+
+</div>
+
+<div class="small">
+Previous Day High / Low
+</div>
+
+</div>
+
+
+<div class="liquidity-card">
+
+<h3>1H — Hourly</h3>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+BUY-SIDE
+</span>
+
+<span
+id="hBuy"
+class="liquidity-price buy">
+--
+</span>
+
+</div>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+SELL-SIDE
+</span>
+
+<span
+id="hSell"
+class="liquidity-price sell">
+--
+</span>
+
+</div>
+
+</div>
+
+
+<div class="liquidity-card">
+
+<h3>15M</h3>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+BUY-SIDE
+</span>
+
+<span
+id="m15Buy"
+class="liquidity-price buy">
+--
+</span>
+
+</div>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+SELL-SIDE
+</span>
+
+<span
+id="m15Sell"
+class="liquidity-price sell">
+--
+</span>
+
+</div>
+
+</div>
+
+
+<div class="liquidity-card">
+
+<h3>5M</h3>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+BUY-SIDE
+</span>
+
+<span
+id="m5Buy"
+class="liquidity-price buy">
+--
+</span>
+
+</div>
+
+<div class="liquidity-row">
+
+<span class="liquidity-label">
+SELL-SIDE
+</span>
+
+<span
+id="m5Sell"
+class="liquidity-price sell">
+--
+</span>
+
+</div>
+
+</div>
+
+</div>
+
+
+<div class="nearest">
+
+<div class="nearest-box">
+
+<div class="label">
+NEAREST BUY-SIDE LIQUIDITY
+</div>
+
+<div
+id="nearestAbove"
+class="value">
+--
+</div>
+
+<div
+id="aboveDistance"
+class="small">
+--
+</div>
+
+</div>
+
+<div class="nearest-box">
+
+<div class="label">
+NEAREST SELL-SIDE LIQUIDITY
+</div>
+
+<div
+id="nearestBelow"
+class="value">
+--
+</div>
+
+<div
+id="belowDistance"
+class="small">
+--
+</div>
+
+</div>
+
+</div>
+
+
+<div class="sweep">
+
+<div class="label">
+LIQUIDITY SWEEP STATUS
+</div>
+
+<div
+id="sweep5"
+class="value">
+5M: --
+</div>
+
+<div
+id="sweep15"
+class="value">
+15M: --
+</div>
+
+<div
+id="sweep1h"
+class="value">
+1H: --
+</div>
+
+<div
+id="sweep1d"
+class="value">
+1D: --
+</div>
+
+</div>
+
+
 <div class="price-card">
 
 <div class="asset">
 🛢️ Crude Oil — WTI
 </div>
 
-<div
-class="price">
+<div class="price">
 --
 </div>
 
@@ -1027,11 +2197,187 @@ document.getElementById(
 );
 
 
-function updateAnalysis(data) {
+function firstLevel(
+    levels
+) {
+
+    if (
+        !levels ||
+        levels.length === 0
+    ) {
+
+        return "--";
+    }
+
+    return (
+        Number(
+            levels[0].price
+        ).toFixed(3)
+        +
+        " "
+        +
+        "("
+        +
+        levels[0].type
+        +
+        ")"
+    );
+}
+
+
+function updateLiquidity(
+    liquidity,
+    sweeps
+) {
+
+    if (!liquidity) {
+        return;
+    }
+
+    document.getElementById(
+        "dBuy"
+    ).innerText =
+        firstLevel(
+            liquidity["1D"].buy_side
+        );
+
+    document.getElementById(
+        "dSell"
+    ).innerText =
+        firstLevel(
+            liquidity["1D"].sell_side
+        );
+
+    document.getElementById(
+        "hBuy"
+    ).innerText =
+        firstLevel(
+            liquidity["1H"].buy_side
+        );
+
+    document.getElementById(
+        "hSell"
+    ).innerText =
+        firstLevel(
+            liquidity["1H"].sell_side
+        );
+
+    document.getElementById(
+        "m15Buy"
+    ).innerText =
+        firstLevel(
+            liquidity["15M"].buy_side
+        );
+
+    document.getElementById(
+        "m15Sell"
+    ).innerText =
+        firstLevel(
+            liquidity["15M"].sell_side
+        );
+
+    document.getElementById(
+        "m5Buy"
+    ).innerText =
+        firstLevel(
+            liquidity["5M"].buy_side
+        );
+
+    document.getElementById(
+        "m5Sell"
+    ).innerText =
+        firstLevel(
+            liquidity["5M"].sell_side
+        );
+
+
+    document.getElementById(
+        "nearestAbove"
+    ).innerText =
+        liquidity.nearest_above === null
+        ? "--"
+        : Number(
+            liquidity.nearest_above
+        ).toFixed(3);
+
+
+    document.getElementById(
+        "nearestBelow"
+    ).innerText =
+        liquidity.nearest_below === null
+        ? "--"
+        : Number(
+            liquidity.nearest_below
+        ).toFixed(3);
+
+
+    document.getElementById(
+        "aboveDistance"
+    ).innerText =
+        liquidity.nearest_above_distance === null
+        ? "--"
+        :
+        "Distance: "
+        +
+        Number(
+            liquidity.nearest_above_distance
+        ).toFixed(3);
+
+
+    document.getElementById(
+        "belowDistance"
+    ).innerText =
+        liquidity.nearest_below_distance === null
+        ? "--"
+        :
+        "Distance: "
+        +
+        Number(
+            liquidity.nearest_below_distance
+        ).toFixed(3);
+
+
+    if (sweeps) {
+
+        document.getElementById(
+            "sweep5"
+        ).innerText =
+            "5M: "
+            +
+            sweeps["5M"];
+
+        document.getElementById(
+            "sweep15"
+        ).innerText =
+            "15M: "
+            +
+            sweeps["15M"];
+
+        document.getElementById(
+            "sweep1h"
+        ).innerText =
+            "1H: "
+            +
+            sweeps["1H"];
+
+        document.getElementById(
+            "sweep1d"
+        ).innerText =
+            "1D: "
+            +
+            sweeps["1D"];
+    }
+}
+
+
+function updateAnalysis(
+    data
+) {
 
     goldPrice.innerText =
-        Number(data.price)
-        .toFixed(3);
+        Number(
+            data.price
+        ).toFixed(3);
 
     goldStatus.innerText =
         "LIVE";
@@ -1078,11 +2424,18 @@ function updateAnalysis(data) {
 
     confidence.innerText =
         "Confidence: "
-        + a.confidence
-        + "%";
+        +
+        a.confidence
+        +
+        "%";
 
     summary.innerText =
         a.summary;
+
+    updateLiquidity(
+        a.liquidity,
+        a.sweeps
+    );
 }
 
 
@@ -1092,7 +2445,8 @@ new EventSource(
 );
 
 
-stream.onopen = function() {
+stream.onopen =
+function() {
 
     console.log(
         "TRADING-AI STREAM CONNECTED"
@@ -1116,7 +2470,9 @@ function(event) {
             "gold_update"
         ) {
 
-            updateAnalysis(data);
+            updateAnalysis(
+                data
+            );
 
         }
 
@@ -1176,14 +2532,18 @@ def stream():
 
                 try:
 
-                    message = client_queue.get(
-                        timeout=15
+                    message = (
+                        client_queue.get(
+                            timeout=15
+                        )
                     )
 
                     yield (
                         "data: "
-                        + message
-                        + "\n\n"
+                        +
+                        message
+                        +
+                        "\n\n"
                     )
 
                 except queue.Empty:
@@ -1196,7 +2556,10 @@ def stream():
 
             with clients_lock:
 
-                if client_queue in clients:
+                if (
+                    client_queue
+                    in clients
+                ):
 
                     clients.remove(
                         client_queue
@@ -1212,14 +2575,16 @@ def stream():
         headers={
 
             "Cache-Control":
-            "no-cache",
+                "no-cache",
 
             "X-Accel-Buffering":
-            "no",
+                "no",
 
             "Connection":
-            "keep-alive"
+                "keep-alive"
+
         }
+
     )
 
 
@@ -1230,18 +2595,31 @@ def stream():
 @app.route("/health")
 def health():
 
+    with candle_lock:
+
+        candle_counts = {
+            key: len(value)
+            for key, value
+            in candle_data.items()
+        }
+
     return {
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "live_engine":
-        engine_started,
+            engine_started,
 
         "api_key":
-        bool(API_KEY),
+            bool(API_KEY),
 
         "gold_history":
-        len(history)
+            len(history),
+
+        "candles":
+            candle_counts
+
     }
 
 
@@ -1263,4 +2641,5 @@ if __name__ == "__main__":
         ),
 
         threaded=True
+
     )
