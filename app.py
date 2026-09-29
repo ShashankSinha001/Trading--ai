@@ -93,7 +93,10 @@ def heartbeat(ws):
 
 def websocket_worker():
 
+    print("WEBSOCKET ENGINE STARTING", flush=True)
+
     if not API_KEY:
+        print("API KEY MISSING", flush=True)
         update_status("API KEY MISSING")
         return
 
@@ -109,6 +112,8 @@ def websocket_worker():
             )
 
             def on_open(ws):
+
+                print("TWELVE DATA CONNECTED", flush=True)
 
                 subscribe_message = {
                     "action": "subscribe",
@@ -130,6 +135,8 @@ def websocket_worker():
             def on_message(ws, message):
 
                 try:
+
+                    print("TWELVE DATA MESSAGE:", message, flush=True)
 
                     data = json.loads(message)
 
@@ -158,11 +165,20 @@ def websocket_worker():
 
                 except Exception as error:
 
-                    print("MESSAGE ERROR:", error)
+                    print(
+                        "MESSAGE ERROR:",
+                        error,
+                        flush=True
+                    )
 
             def on_error(ws, error):
 
-                print("WEBSOCKET ERROR:", error)
+                print(
+                    "WEBSOCKET ERROR:",
+                    error,
+                    flush=True
+                )
+
                 update_status("CONNECTION ERROR")
 
             def on_close(ws, close_status_code, close_msg):
@@ -170,7 +186,8 @@ def websocket_worker():
                 print(
                     "WEBSOCKET CLOSED:",
                     close_status_code,
-                    close_msg
+                    close_msg,
+                    flush=True
                 )
 
                 update_status("RECONNECTING")
@@ -183,6 +200,8 @@ def websocket_worker():
                 on_close=on_close
             )
 
+            print("CONNECTING TO TWELVE DATA", flush=True)
+
             ws.run_forever(
                 ping_interval=20,
                 ping_timeout=10
@@ -190,7 +209,12 @@ def websocket_worker():
 
         except Exception as error:
 
-            print("ENGINE ERROR:", error)
+            print(
+                "ENGINE ERROR:",
+                error,
+                flush=True
+            )
+
             update_status("RECONNECTING")
 
         time.sleep(5)
@@ -214,13 +238,13 @@ def start_live_engine():
 
         thread.start()
 
-        print("LIVE ENGINE STARTED")
+        print("LIVE ENGINE STARTED", flush=True)
 
 
-# IMPORTANT:
-# Gunicorn imports this file instead of running it directly.
-# Therefore the live engine must start during import.
-start_live_engine()
+@app.before_request
+def ensure_live_engine():
+
+    start_live_engine()
 
 
 HTML = """
@@ -363,11 +387,15 @@ Waiting...
 </div>
 
 <div class="row">
-<span class="label">Connection</span>
+
+<span class="label">
+Connection
+</span>
 
 <span class="status" id="oilStatus">
 Connecting...
 </span>
+
 </div>
 
 </div>
@@ -386,7 +414,9 @@ Waiting...
 
 <div class="row">
 
-<span class="label">Connection</span>
+<span class="label">
+Connection
+</span>
 
 <span class="status" id="goldStatus">
 Connecting...
@@ -409,6 +439,7 @@ Price updates are pushed automatically — no page refresh required.
 
 const stream = new EventSource("/stream");
 
+
 stream.onopen = function() {
 
     document.getElementById(
@@ -427,6 +458,7 @@ stream.onmessage = function(event) {
     try {
 
         const data = JSON.parse(event.data);
+
 
         if (data.type === "initial") {
 
@@ -453,6 +485,7 @@ stream.onmessage = function(event) {
                 ).innerText = "LIVE";
 
             }
+
 
             if (
                 data.gold &&
@@ -583,8 +616,8 @@ def stream():
 
                 initial_state = {
                     "type": "initial",
-                    "gold": latest["gold"],
-                    "oil": latest["oil"]
+                    "gold": dict(latest["gold"]),
+                    "oil": dict(latest["oil"])
                 }
 
             yield (
@@ -635,7 +668,7 @@ def health():
 
     return {
         "status": "ok",
-        "live_engine": True,
+        "live_engine": engine_started,
         "api_key": bool(API_KEY)
     }
 
@@ -644,5 +677,6 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=int(os.environ.get("PORT", 10000)),
+        threaded=True
     )
