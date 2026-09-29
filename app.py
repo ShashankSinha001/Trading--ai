@@ -12,7 +12,6 @@ from urllib.parse import quote
 app = Flask(__name__)
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
-
 GOLD_SYMBOL = "XAU/USD"
 
 latest = {
@@ -76,31 +75,24 @@ def broadcast(data):
 
 
 # =========================================================
-# TWELVE DATA CANDLES
+# CANDLES
 # =========================================================
 
 def fetch_candles(interval, outputsize=200):
     if not API_KEY:
-        print(
-            "CANDLE ERROR: TWELVE_DATA_API_KEY missing",
-            flush=True
-        )
+        print("CANDLE ERROR: API KEY MISSING", flush=True)
         return []
-
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-        "symbol": GOLD_SYMBOL,
-        "interval": interval,
-        "outputsize": outputsize,
-        "timezone": "UTC",
-        "apikey": API_KEY
-    }
 
     try:
         r = requests.get(
-            url,
-            params=params,
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": GOLD_SYMBOL,
+                "interval": interval,
+                "outputsize": outputsize,
+                "timezone": "UTC",
+                "apikey": API_KEY
+            },
             timeout=15
         )
 
@@ -118,11 +110,9 @@ def fetch_candles(interval, outputsize=200):
             )
             return []
 
-        values = list(reversed(data["values"]))
-
         candles = []
 
-        for x in values:
+        for x in reversed(data["values"]):
             try:
                 candles.append({
                     "datetime": x.get("datetime"),
@@ -132,7 +122,7 @@ def fetch_candles(interval, outputsize=200):
                     "close": float(x["close"])
                 })
             except Exception:
-                continue
+                pass
 
         print(
             f"CANDLES {interval}: {len(candles)}",
@@ -154,14 +144,12 @@ def update_all_candles():
         candles = fetch_candles(interval)
 
         if candles:
-            candle_data[name] = candles
+            with state_lock:
+                candle_data[name] = candles
 
 
 def candle_worker():
-    print(
-        "CANDLE ENGINE STARTING",
-        flush=True
-    )
+    print("CANDLE ENGINE STARTING", flush=True)
 
     update_all_candles()
 
@@ -169,7 +157,6 @@ def candle_worker():
         try:
             time.sleep(60)
             update_all_candles()
-
         except Exception as e:
             print(
                 f"CANDLE WORKER ERROR: {e}",
@@ -186,14 +173,12 @@ def ema(values, period):
     if not values:
         return None
 
-    if len(values) < period:
-        period = len(values)
+    period = min(period, len(values))
 
     if period <= 0:
         return None
 
     multiplier = 2 / (period + 1)
-
     result = values[0]
 
     for value in values[1:]:
@@ -215,35 +200,23 @@ def rsi(values, period=14):
     for i in range(1, len(values)):
         change = values[i] - values[i - 1]
 
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-    if len(gains) < period:
-        period = len(gains)
+    period = min(period, len(gains))
 
     if period <= 0:
         return None
 
-    avg_gain = (
-        sum(gains[-period:]) / period
-    )
-
-    avg_loss = (
-        sum(losses[-period:]) / period
-    )
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
 
     if avg_loss == 0:
         return 100.0
 
     rs = avg_gain / avg_loss
 
-    return 100 - (
-        100 / (1 + rs)
-    )
+    return 100 - (100 / (1 + rs))
 
 
 # =========================================================
@@ -294,7 +267,7 @@ def swing_lows(candles, lookback=2):
         lookback,
         len(candles) - lookback
     ):
-        l = candles[i]["low"]
+        low = candles[i]["low"]
 
         left = [
             candles[j]["low"]
@@ -312,8 +285,20 @@ def swing_lows(candles, lookback=2):
             )
         ]
 
-        if l < min(left) and l < min(right):
-            result.append(l)
+        if low < min(left) and low < min(right):
+            result.append(low)
+
+    return result
+
+
+def unique_levels(levels, tolerance=0.15):
+    result = []
+
+    for level in sorted(levels):
+        if not result:
+            result.append(level)
+        elif abs(level - result[-1]) > tolerance:
+            result.append(level)
 
     return result
 
@@ -322,29 +307,17 @@ def swing_lows(candles, lookback=2):
 # LIQUIDITY
 # =========================================================
 
-def unique_levels(levels, tolerance=0.15):
-    levels = sorted(levels)
-
-    result = []
-
-    for level in levels:
-        if not result:
-            result.append(level)
-            continue
-
-        if abs(
-            level - result[-1]
-        ) > tolerance:
-            result.append(level)
-
-    return result
-
-
 def calculate_liquidity(price):
     buy_side = []
     sell_side = []
 
-    d1 = candle_data.get("1D", [])
+    with state_lock:
+        data_copy = {
+            tf: list(candle_data.get(tf, []))
+            for tf in candle_data
+        }
+
+    d1 = data_copy["1D"]
 
     if len(d1) >= 2:
         previous = d1[-2]
@@ -362,22 +335,20 @@ def calculate_liquidity(price):
         })
 
     for tf in ["1H", "15M", "5M"]:
-        candles = candle_data.get(tf, [])
+        candles = data_copy[tf]
 
-        highs = swing_highs(candles)
-        lows = swing_lows(candles)
-
-        highs = unique_levels(highs)
-        lows = unique_levels(lows)
-
-        for level in highs[-15:]:
+        for level in unique_levels(
+            swing_highs(candles)
+        )[-15:]:
             buy_side.append({
                 "timeframe": tf,
                 "type": "Swing High",
                 "price": level
             })
 
-        for level in lows[-15:]:
+        for level in unique_levels(
+            swing_lows(candles)
+        )[-15:]:
             sell_side.append({
                 "timeframe": tf,
                 "type": "Swing Low",
@@ -394,32 +365,23 @@ def calculate_liquidity(price):
         if x["price"] < price
     ]
 
-    buy_side.sort(
-        key=lambda x: x["price"]
-    )
-
+    buy_side.sort(key=lambda x: x["price"])
     sell_side.sort(
         key=lambda x: x["price"],
         reverse=True
     )
 
-    nearest_buy = (
-        buy_side[0]
-        if buy_side
-        else None
-    )
-
-    nearest_sell = (
-        sell_side[0]
-        if sell_side
-        else None
-    )
-
     return {
         "buy_side": buy_side,
         "sell_side": sell_side,
-        "nearest_buy": nearest_buy,
-        "nearest_sell": nearest_sell
+        "nearest_buy": (
+            buy_side[0]
+            if buy_side else None
+        ),
+        "nearest_sell": (
+            sell_side[0]
+            if sell_side else None
+        )
     }
 
 
@@ -430,13 +392,14 @@ def calculate_liquidity(price):
 def detect_liquidity_sweeps():
     sweeps = []
 
-    for tf in [
-        "5M",
-        "15M",
-        "1H",
-        "1D"
-    ]:
-        candles = candle_data.get(tf, [])
+    with state_lock:
+        data_copy = {
+            tf: list(candle_data.get(tf, []))
+            for tf in candle_data
+        }
+
+    for tf in ["5M", "15M", "1H", "1D"]:
+        candles = data_copy[tf]
 
         if len(candles) < 3:
             continue
@@ -472,7 +435,10 @@ def detect_liquidity_sweeps():
 # =========================================================
 
 def timeframe_bias(tf):
-    candles = candle_data.get(tf, [])
+    with state_lock:
+        candles = list(
+            candle_data.get(tf, [])
+        )
 
     if len(candles) < 20:
         return "UNKNOWN"
@@ -486,25 +452,25 @@ def timeframe_bias(tf):
     ema50 = ema(closes, 50)
 
     recent = candles[-6:]
+    previous = candles[-12:-6]
+
+    if not previous:
+        return "UNKNOWN"
 
     recent_high = max(
-        x["high"]
-        for x in recent
+        x["high"] for x in recent
     )
 
     previous_high = max(
-        x["high"]
-        for x in candles[-12:-6]
+        x["high"] for x in previous
     )
 
     recent_low = min(
-        x["low"]
-        for x in recent
+        x["low"] for x in recent
     )
 
     previous_low = min(
-        x["low"]
-        for x in candles[-12:-6]
+        x["low"] for x in previous
     )
 
     last = closes[-1]
@@ -512,19 +478,13 @@ def timeframe_bias(tf):
     bullish = 0
     bearish = 0
 
-    if (
-        ema20 is not None
-        and ema50 is not None
-    ):
-        if ema20 > ema50:
-            bullish += 1
-
-        elif ema20 < ema50:
-            bearish += 1
+    if ema20 > ema50:
+        bullish += 1
+    elif ema20 < ema50:
+        bearish += 1
 
     if last > ema20:
         bullish += 1
-
     elif last < ema20:
         bearish += 1
 
@@ -550,7 +510,7 @@ def timeframe_bias(tf):
 
 
 # =========================================================
-# AI MARKET CONCLUSION
+# AI CONCLUSION
 # =========================================================
 
 def generate_ai_conclusion(
@@ -572,30 +532,23 @@ def generate_ai_conclusion(
 
     for tf, weight in weights.items():
         bias = timeframe_bias(tf)
-
         biases[tf] = bias
 
         if bias == "BULLISH":
             score += weight
-
             reasons.append(
                 f"{tf} structure is bullish"
             )
 
         elif bias == "BEARISH":
             score -= weight
-
             reasons.append(
                 f"{tf} structure is bearish"
             )
 
-    # Sweep logic
-
     for sweep in sweeps:
-
         if sweep["side"] == "SELL-SIDE":
             score += 2
-
             reasons.append(
                 f'{sweep["timeframe"]} '
                 f'sell-side liquidity sweep'
@@ -603,40 +556,30 @@ def generate_ai_conclusion(
 
         elif sweep["side"] == "BUY-SIDE":
             score -= 2
-
             reasons.append(
                 f'{sweep["timeframe"]} '
                 f'buy-side liquidity sweep'
             )
 
-    nearest_buy = liquidity.get(
-        "nearest_buy"
-    )
-
-    nearest_sell = liquidity.get(
-        "nearest_sell"
-    )
+    nearest_buy = liquidity["nearest_buy"]
+    nearest_sell = liquidity["nearest_sell"]
 
     if nearest_buy and nearest_sell:
-
-        buy_distance = abs(
+        buy_distance = (
             nearest_buy["price"] - price
         )
 
-        sell_distance = abs(
+        sell_distance = (
             price - nearest_sell["price"]
         )
 
         if buy_distance < sell_distance:
             score += 1
-
             reasons.append(
                 "Nearest liquidity is above price"
             )
-
         else:
             score -= 1
-
             reasons.append(
                 "Nearest liquidity is below price"
             )
@@ -654,8 +597,7 @@ def generate_ai_conclusion(
         action = "NO CLEAR EDGE"
 
     confidence = (
-        50
-        + min(abs(score), 10) * 4
+        50 + min(abs(score), 10) * 4
     )
 
     if (
@@ -673,10 +615,7 @@ def generate_ai_conclusion(
         )
 
         decision = "WAIT"
-
-        action = (
-            "HIGHER TIMEFRAME CONFLICT"
-        )
+        action = "HIGHER TIMEFRAME CONFLICT"
 
         reasons.append(
             "1D and 1H direction are conflicting"
@@ -684,8 +623,7 @@ def generate_ai_conclusion(
 
     if not reasons:
         reasons.append(
-            "Waiting for enough market "
-            "structure data"
+            "Waiting for enough market structure data"
         )
 
     entry_zone = "--"
@@ -699,11 +637,8 @@ def generate_ai_conclusion(
                 f'{nearest_sell["price"]:.3f} - '
                 f'{price:.3f}'
             )
-
-        if nearest_sell:
             invalidation = (
-                f'Below '
-                f'{nearest_sell["price"]:.3f}'
+                f'Below {nearest_sell["price"]:.3f}'
             )
 
         if nearest_buy:
@@ -719,11 +654,8 @@ def generate_ai_conclusion(
                 f'{price:.3f} - '
                 f'{nearest_buy["price"]:.3f}'
             )
-
-        if nearest_buy:
             invalidation = (
-                f'Above '
-                f'{nearest_buy["price"]:.3f}'
+                f'Above {nearest_buy["price"]:.3f}'
             )
 
         if nearest_sell:
@@ -735,22 +667,17 @@ def generate_ai_conclusion(
     else:
 
         if nearest_buy and nearest_sell:
-
             entry_zone = (
                 f'Wait: '
                 f'{nearest_sell["price"]:.3f} / '
                 f'{nearest_buy["price"]:.3f}'
             )
 
-            invalidation = (
-                "Wait for confirmation"
-            )
+            invalidation = "Wait for confirmation"
 
             target = (
-                f'Buy-side '
-                f'{nearest_buy["price"]:.3f} / '
-                f'Sell-side '
-                f'{nearest_sell["price"]:.3f}'
+                f'Buy-side {nearest_buy["price"]:.3f} / '
+                f'Sell-side {nearest_sell["price"]:.3f}'
             )
 
     return {
@@ -767,92 +694,59 @@ def generate_ai_conclusion(
 
 
 # =========================================================
-# BASIC MARKET ANALYSIS
+# ANALYSIS
 # =========================================================
 
 def calculate_analysis(price):
-    values = list(
-        history["gold"]
-    )
+    values = list(history["gold"])
 
     if len(values) < 5:
         return None
 
-    ema20 = ema(
-        values[-100:],
-        20
-    )
+    sample = values[-100:]
 
-    ema50 = ema(
-        values[-100:],
-        50
-    )
-
-    current_rsi = rsi(
-        values[-100:],
-        14
-    )
+    ema20 = ema(sample, 20)
+    ema50 = ema(sample, 50)
+    current_rsi = rsi(sample, 14)
 
     if len(values) >= 10:
-
         if values[-1] > values[-10]:
             trend = "BULLISH"
-
         elif values[-1] < values[-10]:
             trend = "BEARISH"
-
         else:
             trend = "NEUTRAL"
-
     else:
         trend = "NEUTRAL"
 
     if len(values) >= 5:
-
         if values[-1] > values[-5]:
             momentum = "BUYING"
-
         elif values[-1] < values[-5]:
             momentum = "SELLING"
-
         else:
             momentum = "NEUTRAL"
-
     else:
         momentum = "NEUTRAL"
 
     if len(values) >= 20:
+        recent = values[-20:]
 
-        recent_high = max(
-            values[-20:]
-        )
+        support = min(recent)
+        resistance = max(recent)
 
-        recent_low = min(
-            values[-20:]
-        )
-
-        if price >= recent_high:
+        if price >= resistance:
             structure = "BREAKING HIGH"
-
-        elif price <= recent_low:
+        elif price <= support:
             structure = "BREAKING LOW"
-
         else:
             structure = "RANGE"
-
-        support = recent_low
-        resistance = recent_high
-
     else:
-        structure = "BUILDING"
-
         support = min(values)
         resistance = max(values)
+        structure = "BUILDING"
 
-    liquidity = calculate_liquidity(
-        price
-    )
-
+    liquidity = calculate_liquidity(price)
     sweeps = detect_liquidity_sweeps()
 
     ai = generate_ai_conclusion(
@@ -880,14 +774,8 @@ def calculate_analysis(price):
             if ema50 is not None
             else None
         ),
-        "support": round(
-            support,
-            3
-        ),
-        "resistance": round(
-            resistance,
-            3
-        ),
+        "support": round(support, 3),
+        "resistance": round(resistance, 3),
         "liquidity": liquidity,
         "sweeps": sweeps,
         "ai": ai
@@ -895,7 +783,7 @@ def calculate_analysis(price):
 
 
 # =========================================================
-# GOLD WEBSOCKET
+# GOLD LIVE ENGINE
 # =========================================================
 
 def gold_worker():
@@ -906,22 +794,16 @@ def gold_worker():
     )
 
     if not API_KEY:
-
         print(
-            "GOLD ERROR: "
-            "TWELVE_DATA_API_KEY NOT FOUND",
+            "GOLD ERROR: API KEY MISSING",
             flush=True
         )
 
         with state_lock:
-            latest["gold"]["status"] = (
-                "API KEY MISSING"
-            )
+            latest["gold"]["status"] = "API KEY MISSING"
 
         return
 
-    # Twelve Data requires the API key
-    # in the WebSocket connection URL.
     encoded_api_key = quote(
         API_KEY,
         safe=""
@@ -946,7 +828,7 @@ def gold_worker():
 
             ws = websocket.create_connection(
                 ws_url,
-                timeout=15
+                timeout=30
             )
 
             print(
@@ -954,29 +836,22 @@ def gold_worker():
                 flush=True
             )
 
-            subscribe_message = {
-                "action": "subscribe",
-                "params": {
-                    "symbols": GOLD_SYMBOL
-                }
-            }
-
             ws.send(
-                json.dumps(
-                    subscribe_message
-                )
+                json.dumps({
+                    "action": "subscribe",
+                    "params": {
+                        "symbols": GOLD_SYMBOL
+                    }
+                })
             )
 
             print(
-                f"GOLD SUBSCRIBE SENT: "
-                f"{GOLD_SYMBOL}",
+                f"GOLD SUBSCRIBE SENT: {GOLD_SYMBOL}",
                 flush=True
             )
 
             with state_lock:
-                latest["gold"]["status"] = (
-                    "Connected"
-                )
+                latest["gold"]["status"] = "LIVE"
 
             while True:
 
@@ -989,65 +864,36 @@ def gold_worker():
 
                 try:
                     data = json.loads(raw)
-
                 except Exception:
-
-                    print(
-                        f"GOLD RAW MESSAGE: "
-                        f"{raw}",
-                        flush=True
-                    )
-
                     continue
 
-                print(
-                    f"GOLD WS: {data}",
-                    flush=True
-                )
-
-                if (
-                    data.get("event")
-                    == "subscribe-status"
-                ):
-
+                if data.get("event") == "subscribe-status":
                     print(
-                        f"GOLD SUBSCRIPTION: "
-                        f"{data}",
+                        f"GOLD SUBSCRIPTION: {data}",
                         flush=True
                     )
-
                     continue
 
                 if data.get("status") == "error":
-
                     print(
-                        f"GOLD API ERROR: "
-                        f"{data}",
+                        f"GOLD API ERROR: {data}",
                         flush=True
                     )
-
                     continue
 
-                price = data.get(
-                    "price"
-                )
+                price = data.get("price")
 
                 if price is None:
                     continue
 
                 try:
                     price = float(price)
-
                 except Exception:
                     continue
 
-                history["gold"].append(
-                    price
-                )
+                history["gold"].append(price)
 
-                analysis = calculate_analysis(
-                    price
-                )
+                analysis = calculate_analysis(price)
 
                 now = time.strftime(
                     "%Y-%m-%d %H:%M:%S UTC",
@@ -1055,7 +901,6 @@ def gold_worker():
                 )
 
                 with state_lock:
-
                     latest["gold"] = {
                         "price": price,
                         "status": "LIVE",
@@ -1073,22 +918,6 @@ def gold_worker():
                     "gold": latest["gold"]
                 })
 
-        except websocket.WebSocketTimeoutException:
-
-            print(
-                "GOLD WS TIMEOUT - "
-                "RECONNECTING",
-                flush=True
-            )
-
-        except websocket.WebSocketConnectionClosedException:
-
-            print(
-                "GOLD WS CLOSED - "
-                "RECONNECTING",
-                flush=True
-            )
-
         except Exception as e:
 
             print(
@@ -1096,20 +925,17 @@ def gold_worker():
                 flush=True
             )
 
-        finally:
-
             with state_lock:
-
                 if latest["gold"]["price"] is None:
                     latest["gold"]["status"] = (
                         "Reconnecting..."
                     )
 
-            if ws is not None:
+        finally:
 
+            if ws is not None:
                 try:
                     ws.close()
-
                 except Exception:
                     pass
 
@@ -1117,7 +943,7 @@ def gold_worker():
 
 
 # =========================================================
-# OIL PLACEHOLDER
+# OIL
 # =========================================================
 
 def oil_worker():
@@ -1126,12 +952,6 @@ def oil_worker():
         "OIL ENGINE STARTING",
         flush=True
     )
-
-    with state_lock:
-
-        latest["oil"]["status"] = (
-            "DATA SOURCE REQUIRED"
-        )
 
     while True:
         time.sleep(60)
@@ -1179,119 +999,125 @@ HTML = """
 <head>
 
 <meta name="viewport"
-      content="width=device-width, initial-scale=1">
+content="width=device-width, initial-scale=1">
 
 <title>Trading-AI</title>
 
 <style>
 
 body {
-    margin: 0;
-    background: #0b0f14;
-    color: #f5f5f5;
-    font-family: Arial, sans-serif;
+    margin:0;
+    background:#0b0f14;
+    color:#f5f5f5;
+    font-family:Arial,sans-serif;
 }
 
 .container {
-    max-width: 1100px;
-    margin: auto;
-    padding: 20px;
+    max-width:1100px;
+    margin:auto;
+    padding:20px;
 }
 
 h1 {
-    margin-bottom: 5px;
+    margin-bottom:5px;
 }
 
 .subtitle {
-    color: #8b949e;
-    margin-bottom: 25px;
+    color:#8b949e;
+    margin-bottom:25px;
 }
 
 .card {
-    background: #111820;
-    border: 1px solid #26313d;
-    border-radius: 14px;
-    padding: 20px;
-    margin-bottom: 18px;
+    background:#111820;
+    border:1px solid #26313d;
+    border-radius:14px;
+    padding:20px;
+    margin-bottom:18px;
 }
 
 .price {
-    font-size: 42px;
-    font-weight: bold;
-    margin: 12px 0;
+    font-size:42px;
+    font-weight:bold;
+    margin:12px 0;
 }
 
 .live {
-    color: #35d07f;
-    font-weight: bold;
+    color:#35d07f;
+    font-weight:bold;
 }
 
 .waiting {
-    color: #f0b429;
+    color:#f0b429;
 }
 
 .grid {
-    display: grid;
+    display:grid;
     grid-template-columns:
-        repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
+    repeat(auto-fit,minmax(180px,1fr));
+    gap:12px;
 }
 
 .metric {
-    background: #0d131a;
-    padding: 14px;
-    border-radius: 10px;
-    border: 1px solid #202a35;
+    background:#0d131a;
+    padding:14px;
+    border-radius:10px;
+    border:1px solid #202a35;
 }
 
 .label {
-    color: #8b949e;
-    font-size: 12px;
-    margin-bottom: 6px;
+    color:#8b949e;
+    font-size:12px;
+    margin-bottom:6px;
 }
 
 .value {
-    font-size: 18px;
-    font-weight: bold;
+    font-size:18px;
+    font-weight:bold;
 }
 
 .conclusion {
-    text-align: center;
-    padding: 25px;
+    text-align:center;
+    padding:25px;
 }
 
 .decision {
-    font-size: 38px;
-    font-weight: bold;
-    margin: 10px 0;
+    font-size:38px;
+    font-weight:bold;
+    margin:10px 0;
 }
 
 .why {
-    text-align: left;
-    margin-top: 18px;
+    text-align:left;
+    margin-top:18px;
 }
 
 .why div {
-    padding: 6px 0;
-    color: #c9d1d9;
+    padding:6px 0;
+    color:#c9d1d9;
 }
 
 .liquidity-row {
-    display: grid;
+    display:grid;
     grid-template-columns:
-        repeat(auto-fit, minmax(220px, 1fr));
-    gap: 12px;
+    repeat(auto-fit,minmax(220px,1fr));
+    gap:12px;
 }
 
 .liquidity-box {
-    background: #0d131a;
-    padding: 14px;
-    border-radius: 10px;
+    background:#0d131a;
+    padding:14px;
+    border-radius:10px;
 }
 
 .small {
-    color: #8b949e;
-    font-size: 13px;
+    color:#8b949e;
+    font-size:13px;
+}
+
+#streamStatus {
+    font-size:13px;
+    color:#8b949e;
+    margin-top:8px;
 }
 
 </style>
@@ -1315,13 +1141,17 @@ Real-time market intelligence
 </div>
 
 <div id="goldStatus"
-     class="waiting">
+class="waiting">
 Connecting...
 </div>
 
 <div id="goldPrice"
-     class="price">
+class="price">
 Waiting...
+</div>
+
+<div id="streamStatus">
+Browser stream: connecting...
 </div>
 
 <div class="small">
@@ -1336,7 +1166,7 @@ XAU/USD · Twelve Data
 <h2>🧠 AI MARKET CONCLUSION</h2>
 
 <div id="decision"
-     class="decision">
+class="decision">
 WAIT
 </div>
 
@@ -1349,76 +1179,36 @@ Waiting for market data...
 <div class="grid">
 
 <div class="metric">
-
-<div class="label">
-CONFIDENCE
-</div>
-
+<div class="label">CONFIDENCE</div>
 <div id="confidence"
-     class="value">
---
+class="value">--</div>
 </div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-AI SCORE
-</div>
-
+<div class="label">AI SCORE</div>
 <div id="score"
-     class="value">
---
+class="value">--</div>
 </div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-ENTRY ZONE
-</div>
-
+<div class="label">ENTRY ZONE</div>
 <div id="entry"
-     class="value">
---
+class="value">--</div>
 </div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-INVALIDATION
-</div>
-
+<div class="label">INVALIDATION</div>
 <div id="invalidation"
-     class="value">
---
+class="value">--</div>
 </div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-TARGET LIQUIDITY
-</div>
-
+<div class="label">TARGET LIQUIDITY</div>
 <div id="target"
-     class="value">
---
+class="value">--</div>
 </div>
 
 </div>
-
-</div>
-
 
 <div class="why">
 
@@ -1440,86 +1230,33 @@ Waiting...
 <div class="grid">
 
 <div class="metric">
-
-<div class="label">
-TREND
+<div class="label">TREND</div>
+<div id="trend" class="value">--</div>
 </div>
-
-<div id="trend"
-     class="value">
---
-</div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-MOMENTUM
+<div class="label">MOMENTUM</div>
+<div id="momentum" class="value">--</div>
 </div>
-
-<div id="momentum"
-     class="value">
---
-</div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-STRUCTURE
+<div class="label">STRUCTURE</div>
+<div id="structure" class="value">--</div>
 </div>
-
-<div id="structure"
-     class="value">
---
-</div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-RSI
+<div class="label">RSI</div>
+<div id="rsi" class="value">--</div>
 </div>
-
-<div id="rsi"
-     class="value">
---
-</div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-EMA 20
+<div class="label">EMA 20</div>
+<div id="ema20" class="value">--</div>
 </div>
-
-<div id="ema20"
-     class="value">
---
-</div>
-
-</div>
-
 
 <div class="metric">
-
-<div class="label">
-EMA 50
-</div>
-
-<div id="ema50"
-     class="value">
---
-</div>
-
+<div class="label">EMA 50</div>
+<div id="ema50" class="value">--</div>
 </div>
 
 </div>
@@ -1543,7 +1280,6 @@ Waiting...
 
 </div>
 
-
 <div class="liquidity-box">
 
 <h3>SELL-SIDE</h3>
@@ -1558,29 +1294,17 @@ Waiting...
 
 </div>
 
-
-<div class="card">
-
-<h2>Gold XAU/USD</h2>
-
-<div class="small">
-Data source: Twelve Data
-</div>
-
-</div>
-
 </div>
 
 
 <script>
 
-function setText(id, value) {
+function setText(id,value) {
 
     const el =
         document.getElementById(id);
 
     if (el) {
-
         el.innerText =
             value === null ||
             value === undefined
@@ -1592,18 +1316,14 @@ function setText(id, value) {
 
 function formatLiquidity(items) {
 
-    if (
-        !items ||
-        items.length === 0
-    ) {
+    if (!items || items.length === 0) {
         return "No nearby liquidity";
     }
 
     return items
-        .slice(0, 8)
+        .slice(0,8)
         .map(x =>
-            `${x.timeframe} · `
-            + `${x.type} · `
+            `${x.timeframe} · ${x.type} · `
             + `${Number(x.price).toFixed(3)}`
         )
         .join("\\n");
@@ -1616,109 +1336,47 @@ function updateGold(gold) {
 
     setText(
         "goldStatus",
-        gold.status ||
-        "Connecting..."
+        gold.status || "LIVE"
     );
 
     if (gold.price !== null) {
-
         setText(
             "goldPrice",
-            Number(
-                gold.price
-            ).toFixed(3)
+            Number(gold.price).toFixed(3)
         );
     }
 
-    const a =
-        gold.analysis;
+    const a = gold.analysis;
 
     if (!a) return;
 
-    setText(
-        "trend",
-        a.trend
-    );
+    setText("trend",a.trend);
+    setText("momentum",a.momentum);
+    setText("structure",a.structure);
+    setText("rsi",a.rsi);
+    setText("ema20",a.ema20);
+    setText("ema50",a.ema50);
 
-    setText(
-        "momentum",
-        a.momentum
-    );
-
-    setText(
-        "structure",
-        a.structure
-    );
-
-    setText(
-        "rsi",
-        a.rsi
-    );
-
-    setText(
-        "ema20",
-        a.ema20
-    );
-
-    setText(
-        "ema50",
-        a.ema50
-    );
-
-    const ai =
-        a.ai;
+    const ai = a.ai;
 
     if (!ai) return;
 
-    setText(
-        "decision",
-        ai.decision
-    );
-
-    setText(
-        "action",
-        ai.action
-    );
-
-    setText(
-        "confidence",
-        ai.confidence + "%"
-    );
-
-    setText(
-        "score",
-        ai.score
-    );
-
-    setText(
-        "entry",
-        ai.entry_zone
-    );
-
-    setText(
-        "invalidation",
-        ai.invalidation
-    );
-
-    setText(
-        "target",
-        ai.target_liquidity
-    );
+    setText("decision",ai.decision);
+    setText("action",ai.action);
+    setText("confidence",ai.confidence + "%");
+    setText("score",ai.score);
+    setText("entry",ai.entry_zone);
+    setText("invalidation",ai.invalidation);
+    setText("target",ai.target_liquidity);
 
     const why =
-        document.getElementById(
-            "why"
-        );
+        document.getElementById("why");
 
     if (why) {
-
         why.innerHTML =
-            ai.reasons
-                .map(
-                    x =>
-                        `<div>• ${x}</div>`
-                )
-                .join("");
+            (ai.reasons || [])
+            .map(x => `<div>• ${x}</div>`)
+            .join("");
     }
 
     setText(
@@ -1738,62 +1396,92 @@ function updateGold(gold) {
 
 
 // =====================================================
-// SSE
+// SSE STREAM
 // =====================================================
+
+let source = null;
+let reconnectTimer = null;
+
 
 function connectStream() {
 
-    const source =
-        new EventSource(
-            "/stream"
+    if (source) {
+        try {
+            source.close();
+        } catch(e) {}
+    }
+
+    setText(
+        "streamStatus",
+        "Browser stream: connecting..."
+    );
+
+    source = new EventSource("/stream");
+
+    source.onopen = function() {
+
+        console.log(
+            "Trading-AI SSE connected"
         );
 
-    source.onopen =
-        function() {
+        setText(
+            "streamStatus",
+            "Browser stream: CONNECTED"
+        );
+    };
+
+
+    source.onmessage = function(event) {
+
+        try {
+
+            const data =
+                JSON.parse(event.data);
 
             console.log(
-                "Trading-AI "
-                + "stream connected"
+                "SSE DATA:",
+                data
             );
-        };
 
-    source.onmessage =
-        function(event) {
-
-            try {
-
-                const data =
-                    JSON.parse(
-                        event.data
-                    );
-
-                if (
-                    data.type === "gold"
-                ) {
-
-                    updateGold(
-                        data.gold
-                    );
-                }
-
-            } catch (error) {
-
-                console.error(
-                    "Stream parse error:",
-                    error
-                );
+            if (data.type === "gold") {
+                updateGold(data.gold);
             }
-        };
 
-    source.onerror =
-        function() {
+        } catch(error) {
 
-            console.log(
-                "Stream disconnected. "
-                + "Browser will retry."
+            console.error(
+                "SSE parse error:",
+                error
             );
-        };
+        }
+    };
+
+
+    source.onerror = function() {
+
+        console.log(
+            "SSE disconnected"
+        );
+
+        setText(
+            "streamStatus",
+            "Browser stream: reconnecting..."
+        );
+
+        try {
+            source.close();
+        } catch(e) {}
+
+        clearTimeout(reconnectTimer);
+
+        reconnectTimer =
+            setTimeout(
+                connectStream,
+                3000
+            );
+    };
 }
+
 
 connectStream();
 
@@ -1810,36 +1498,27 @@ connectStream();
 
 @app.route("/")
 def home():
-    return render_template_string(
-        HTML
-    )
+    return render_template_string(HTML)
 
 
 @app.route("/stream")
 def stream():
 
-    q = queue.Queue(
-        maxsize=100
-    )
+    q = queue.Queue(maxsize=100)
 
     with clients_lock:
         clients.append(q)
 
-    # Send current snapshot immediately
     with state_lock:
-        current_gold = (
-            latest["gold"].copy()
-        )
+        current_gold = latest["gold"].copy()
 
     try:
-
         q.put_nowait(
             json.dumps({
                 "type": "gold",
                 "gold": current_gold
             })
         )
-
     except Exception:
         pass
 
@@ -1847,17 +1526,35 @@ def stream():
 
         try:
 
+            # Force proxy/browser to start
+            # streaming immediately.
+            yield (
+                ": connected\n"
+                ": " + (" " * 2048) + "\n\n"
+            )
+
+            # Send current state immediately.
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "gold",
+                    "gold": current_gold
+                })
+                + "\n\n"
+            )
+
             while True:
 
                 try:
 
                     message = q.get(
-                        timeout=30
+                        timeout=15
                     )
 
                     yield (
-                        f"data: "
-                        f"{message}\n\n"
+                        "data: "
+                        + message
+                        + "\n\n"
                     )
 
                 except queue.Empty:
@@ -1866,6 +1563,15 @@ def stream():
                         ": heartbeat\n\n"
                     )
 
+        except GeneratorExit:
+            pass
+
+        except Exception as e:
+            print(
+                f"SSE GENERATOR ERROR: {e}",
+                flush=True
+            )
+
         finally:
 
             with clients_lock:
@@ -1873,40 +1579,44 @@ def stream():
                 if q in clients:
                     clients.remove(q)
 
-    return Response(
+    response = Response(
         generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control":
-                "no-cache",
-            "Connection":
-                "keep-alive",
-            "X-Accel-Buffering":
-                "no"
-        }
+        status=200,
+        mimetype="text/event-stream"
     )
+
+    response.headers["Cache-Control"] = (
+        "no-cache, no-store, must-revalidate"
+    )
+
+    response.headers["Connection"] = "keep-alive"
+
+    response.headers["X-Accel-Buffering"] = "no"
+
+    response.headers["Content-Type"] = (
+        "text/event-stream; charset=utf-8"
+    )
+
+    return response
 
 
 @app.route("/health")
 def health():
 
     with state_lock:
-        gold = (
-            latest["gold"].copy()
-        )
+        gold = latest["gold"].copy()
+
+        candle_counts = {
+            tf: len(candle_data[tf])
+            for tf in candle_data
+        }
 
     return {
         "status": "ok",
-        "gold_status":
-            gold["status"],
-        "gold_price":
-            gold["price"],
-        "candles": {
-            tf: len(
-                candle_data[tf]
-            )
-            for tf in candle_data
-        }
+        "gold_status": gold["status"],
+        "gold_price": gold["price"],
+        "gold_updated": gold["updated"],
+        "candles": candle_counts
     }
 
 
@@ -1922,10 +1632,7 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(
-            os.environ.get(
-                "PORT",
-                5000
-            )
+            os.environ.get("PORT",5000)
         ),
         threaded=True
     )
