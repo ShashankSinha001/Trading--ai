@@ -5,6 +5,7 @@ import time
 import threading
 import queue
 import websocket
+import requests
 
 app = Flask(__name__)
 
@@ -20,6 +21,8 @@ latest = {
         "status": "DATA SOURCE REQUIRED"
     }
 }
+
+history = []
 
 clients = []
 clients_lock = threading.Lock()
@@ -52,21 +55,327 @@ def broadcast(data):
 
 
 # =========================================================
-# UPDATE PRICE
+# ANALYSIS ENGINE
 # =========================================================
 
-def update_price(asset, symbol, price):
+def calculate_analysis():
 
     with state_lock:
 
-        latest[asset]["price"] = price
-        latest[asset]["status"] = "LIVE"
+        prices = list(history)
+
+    if len(prices) < 10:
+
+        return {
+            "trend": "CALCULATING",
+            "momentum": "CALCULATING",
+            "structure": "BUILDING DATA",
+            "support": None,
+            "resistance": None,
+            "ema20": None,
+            "ema50": None,
+            "rsi": None,
+            "signal": "WAIT",
+            "confidence": 0,
+            "summary": "Collecting market data..."
+        }
+
+    recent = prices[-100:]
+
+    # -------------------------
+    # EMA
+    # -------------------------
+
+    def ema(values, period):
+
+        if len(values) < period:
+            return sum(values) / len(values)
+
+        multiplier = 2 / (period + 1)
+
+        value = sum(values[:period]) / period
+
+        for price in values[period:]:
+
+            value = (
+                (price - value) * multiplier
+                + value
+            )
+
+        return value
+
+    ema20 = ema(recent, 20)
+
+    ema50 = ema(recent, 50)
+
+
+    # -------------------------
+    # RSI
+    # -------------------------
+
+    changes = []
+
+    for i in range(1, len(recent)):
+
+        changes.append(
+            recent[i] - recent[i - 1]
+        )
+
+    gains = [
+        x for x in changes
+        if x > 0
+    ]
+
+    losses = [
+        abs(x) for x in changes
+        if x < 0
+    ]
+
+    avg_gain = (
+        sum(gains) / len(gains)
+        if gains else 0
+    )
+
+    avg_loss = (
+        sum(losses) / len(losses)
+        if losses else 0
+    )
+
+    if avg_loss == 0:
+
+        rsi = 100
+
+    else:
+
+        rs = avg_gain / avg_loss
+
+        rsi = 100 - (
+            100 / (1 + rs)
+        )
+
+
+    # -------------------------
+    # SUPPORT / RESISTANCE
+    # -------------------------
+
+    support = min(recent)
+
+    resistance = max(recent)
+
+    current = recent[-1]
+
+
+    # -------------------------
+    # TREND
+    # -------------------------
+
+    if current > ema20 > ema50:
+
+        trend = "BULLISH"
+
+    elif current < ema20 < ema50:
+
+        trend = "BEARISH"
+
+    else:
+
+        trend = "SIDEWAYS"
+
+
+    # -------------------------
+    # MOMENTUM
+    # -------------------------
+
+    if rsi >= 60:
+
+        momentum = "STRONG BUYING"
+
+    elif rsi >= 52:
+
+        momentum = "BUYING"
+
+    elif rsi <= 40:
+
+        momentum = "STRONG SELLING"
+
+    elif rsi <= 48:
+
+        momentum = "SELLING"
+
+    else:
+
+        momentum = "NEUTRAL"
+
+
+    # -------------------------
+    # MARKET STRUCTURE
+    # -------------------------
+
+    if len(recent) >= 10:
+
+        old = sum(recent[-10:-5]) / 5
+        new = sum(recent[-5:]) / 5
+
+        if new > old:
+
+            structure = "HIGHER"
+
+        elif new < old:
+
+            structure = "LOWER"
+
+        else:
+
+            structure = "RANGE"
+
+    else:
+
+        structure = "BUILDING"
+
+
+    # -------------------------
+    # SIGNAL
+    # -------------------------
+
+    score = 0
+
+    if trend == "BULLISH":
+        score += 2
+
+    elif trend == "BEARISH":
+        score -= 2
+
+
+    if momentum == "STRONG BUYING":
+        score += 2
+
+    elif momentum == "BUYING":
+        score += 1
+
+    elif momentum == "STRONG SELLING":
+        score -= 2
+
+    elif momentum == "SELLING":
+        score -= 1
+
+
+    if structure == "HIGHER":
+        score += 1
+
+    elif structure == "LOWER":
+        score -= 1
+
+
+    if score >= 4:
+
+        signal = "BUY"
+        confidence = min(90, 60 + score * 5)
+
+    elif score <= -4:
+
+        signal = "SELL"
+        confidence = min(90, 60 + abs(score) * 5)
+
+    else:
+
+        signal = "WAIT"
+        confidence = 50
+
+
+    # -------------------------
+    # SUMMARY
+    # -------------------------
+
+    if signal == "BUY":
+
+        summary = (
+            "Buying pressure is currently stronger "
+            "than selling pressure."
+        )
+
+    elif signal == "SELL":
+
+        summary = (
+            "Selling pressure is currently stronger "
+            "than buying pressure."
+        )
+
+    else:
+
+        summary = (
+            "Market conditions are mixed. "
+            "Waiting for stronger confirmation."
+        )
+
+
+    return {
+
+        "trend": trend,
+
+        "momentum": momentum,
+
+        "structure": structure,
+
+        "support": round(
+            support,
+            3
+        ),
+
+        "resistance": round(
+            resistance,
+            3
+        ),
+
+        "ema20": round(
+            ema20,
+            3
+        ),
+
+        "ema50": round(
+            ema50,
+            3
+        ),
+
+        "rsi": round(
+            rsi,
+            2
+        ),
+
+        "signal": signal,
+
+        "confidence": confidence,
+
+        "summary": summary
+    }
+
+
+# =========================================================
+# UPDATE GOLD
+# =========================================================
+
+def update_gold(price):
+
+    with state_lock:
+
+        latest["gold"]["price"] = price
+        latest["gold"]["status"] = "LIVE"
+
+        history.append(price)
+
+        if len(history) > 500:
+
+            del history[:-500]
+
+    analysis = calculate_analysis()
 
     broadcast({
-        "type": "price",
-        "asset": asset,
-        "symbol": symbol,
+
+        "type": "gold_update",
+
         "price": price,
+
+        "analysis": analysis,
+
         "timestamp": time.time()
     })
 
@@ -89,22 +398,11 @@ def gold_worker():
             flush=True
         )
 
-        with state_lock:
-            latest["gold"]["status"] = "API KEY MISSING"
-
         return
 
     while True:
 
         try:
-
-            with state_lock:
-                latest["gold"]["status"] = "CONNECTING"
-
-            broadcast({
-                "type": "gold_status",
-                "status": "CONNECTING"
-            })
 
             url = (
                 "wss://ws.twelvedata.com/v1/quotes/price?apikey="
@@ -119,7 +417,9 @@ def gold_worker():
                 )
 
                 subscribe = {
+
                     "action": "subscribe",
+
                     "params": {
                         "symbols": "XAU/USD"
                     }
@@ -129,44 +429,31 @@ def gold_worker():
                     json.dumps(subscribe)
                 )
 
-                with state_lock:
-                    latest["gold"]["status"] = "CONNECTED"
-
-                broadcast({
-                    "type": "gold_status",
-                    "status": "CONNECTED"
-                })
-
             def on_message(ws, message):
 
                 try:
-
-                    print(
-                        "GOLD MESSAGE:",
-                        message,
-                        flush=True
-                    )
 
                     data = json.loads(message)
 
                     if data.get("event") == "price":
 
-                        symbol = data.get(
-                            "symbol",
-                            "XAU/USD"
-                        )
-
                         price = data.get("price")
 
                         if price is not None:
 
-                            update_price(
-                                "gold",
-                                symbol,
+                            print(
+                                "GOLD:",
+                                price,
+                                flush=True
+                            )
+
+                            update_gold(
                                 float(price)
                             )
 
-                    elif data.get("event") == "subscribe-status":
+                    elif data.get(
+                        "event"
+                    ) == "subscribe-status":
 
                         print(
                             "GOLD SUBSCRIPTION:",
@@ -190,14 +477,6 @@ def gold_worker():
                     flush=True
                 )
 
-                with state_lock:
-                    latest["gold"]["status"] = "RECONNECTING"
-
-                broadcast({
-                    "type": "gold_status",
-                    "status": "RECONNECTING"
-                })
-
             def on_close(ws, code, message):
 
                 print(
@@ -207,29 +486,23 @@ def gold_worker():
                     flush=True
                 )
 
-                with state_lock:
-                    latest["gold"]["status"] = "RECONNECTING"
-
-                broadcast({
-                    "type": "gold_status",
-                    "status": "RECONNECTING"
-                })
-
             ws = websocket.WebSocketApp(
+
                 url,
+
                 on_open=on_open,
+
                 on_message=on_message,
+
                 on_error=on_error,
+
                 on_close=on_close
             )
 
-            print(
-                "CONNECTING TO TWELVE DATA GOLD",
-                flush=True
-            )
-
             ws.run_forever(
+
                 ping_interval=20,
+
                 ping_timeout=10
             )
 
@@ -255,17 +528,9 @@ def oil_worker():
         flush=True
     )
 
-    with state_lock:
-        latest["oil"]["status"] = "DATA SOURCE REQUIRED"
-
-    broadcast({
-        "type": "oil_status",
-        "status": "DATA SOURCE REQUIRED"
-    })
-
 
 # =========================================================
-# START LIVE ENGINE
+# START ENGINE
 # =========================================================
 
 def start_live_engine():
@@ -275,6 +540,7 @@ def start_live_engine():
     with engine_lock:
 
         if engine_started:
+
             return
 
         engine_started = True
@@ -294,10 +560,6 @@ def start_live_engine():
             flush=True
         )
 
-
-# =========================================================
-# START ENGINE
-# =========================================================
 
 @app.before_request
 def start_engine():
@@ -330,72 +592,168 @@ content="width=device-width, initial-scale=1">
 }
 
 body {
+
     margin: 0;
+
     background: #05070b;
-    color: #ffffff;
+
+    color: white;
+
     font-family: Arial, sans-serif;
 }
 
 .header {
+
     text-align: center;
-    padding: 25px 15px;
-    border-bottom: 1px solid #202631;
+
+    padding: 25px;
+
+    border-bottom:
+    1px solid #202631;
 }
 
 .logo {
+
     font-size: 30px;
+
     font-weight: bold;
 }
 
 .subtitle {
-    margin-top: 7px;
+
     color: #8d96a5;
+
+    margin-top: 7px;
 }
 
 .container {
-    max-width: 1000px;
+
+    max-width: 1100px;
+
     margin: auto;
+
     padding: 25px;
 }
 
-.grid {
-    display: grid;
-    grid-template-columns:
-    repeat(auto-fit, minmax(280px, 1fr));
-    gap: 20px;
-}
+.price-card {
 
-.card {
     background: #0d1118;
-    border: 1px solid #202631;
+
+    border:
+    1px solid #202631;
+
     border-radius: 18px;
+
     padding: 25px;
+
+    margin-bottom: 20px;
 }
 
 .asset {
-    font-size: 21px;
+
+    font-size: 22px;
+
     font-weight: bold;
 }
 
 .price {
-    font-size: 40px;
-    font-weight: bold;
-    margin-top: 22px;
-}
 
-.status {
+    font-size: 42px;
+
+    font-weight: bold;
+
     margin-top: 15px;
-    color: #f0b94b;
 }
 
 .live {
+
     color: #45e08b;
+
+    margin-top: 10px;
 }
 
-.footer {
-    text-align: center;
-    color: #666f7e;
-    margin-top: 30px;
+.analysis {
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(
+        auto-fit,
+        minmax(180px, 1fr)
+    );
+
+    gap: 15px;
+
+    margin-top: 20px;
+}
+
+.box {
+
+    background: #111722;
+
+    border:
+    1px solid #202631;
+
+    border-radius: 14px;
+
+    padding: 18px;
+}
+
+.label {
+
+    color: #8d96a5;
+
+    font-size: 13px;
+
+    text-transform: uppercase;
+}
+
+.value {
+
+    font-size: 20px;
+
+    font-weight: bold;
+
+    margin-top: 8px;
+}
+
+.signal {
+
+    margin-top: 20px;
+
+    padding: 20px;
+
+    border:
+    1px solid #202631;
+
+    border-radius: 15px;
+
+    background: #111722;
+}
+
+.signal-title {
+
+    color: #8d96a5;
+
+    font-size: 13px;
+}
+
+.signal-value {
+
+    font-size: 30px;
+
+    font-weight: bold;
+
+    margin-top: 8px;
+}
+
+.summary {
+
+    margin-top: 10px;
+
+    color: #c5cbd5;
+
+    line-height: 1.5;
 }
 
 </style>
@@ -418,9 +776,7 @@ Real-Time Market Intelligence
 
 <div class="container">
 
-<div class="grid">
-
-<div class="card">
+<div class="price-card">
 
 <div class="asset">
 🥇 Gold — XAU/USD
@@ -434,27 +790,167 @@ Waiting...
 
 <div
 id="goldStatus"
-class="status">
+class="live">
 Connecting...
 </div>
 
+<div class="analysis">
+
+<div class="box">
+
+<div class="label">
+Trend
 </div>
 
-<div class="card">
+<div
+id="trend"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+Momentum
+</div>
+
+<div
+id="momentum"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+Structure
+</div>
+
+<div
+id="structure"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+RSI
+</div>
+
+<div
+id="rsi"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+EMA 20
+</div>
+
+<div
+id="ema20"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+EMA 50
+</div>
+
+<div
+id="ema50"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+Support
+</div>
+
+<div
+id="support"
+class="value">
+--
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="label">
+Resistance
+</div>
+
+<div
+id="resistance"
+class="value">
+--
+</div>
+
+</div>
+
+</div>
+
+<div class="signal">
+
+<div class="signal-title">
+TRADING-AI ANALYSIS
+</div>
+
+<div
+id="signal"
+class="signal-value">
+WAIT
+</div>
+
+<div
+id="confidence"
+class="value">
+Confidence: --
+</div>
+
+<div
+id="summary"
+class="summary">
+Collecting market data...
+</div>
+
+</div>
+
+</div>
+
+
+<div class="price-card">
 
 <div class="asset">
 🛢️ Crude Oil — WTI
 </div>
 
 <div
-id="oilPrice"
 class="price">
-Waiting...
+--
 </div>
 
-<div
-id="oilStatus"
-class="status">
+<div class="live">
 DATA SOURCE REQUIRED
 </div>
 
@@ -462,65 +958,138 @@ DATA SOURCE REQUIRED
 
 </div>
 
-<div class="footer">
-LIVE MARKET ENGINE
-</div>
-
-</div>
 
 <script>
 
 const goldPrice =
-document.getElementById("goldPrice");
-
-const oilPrice =
-document.getElementById("oilPrice");
+document.getElementById(
+    "goldPrice"
+);
 
 const goldStatus =
-document.getElementById("goldStatus");
+document.getElementById(
+    "goldStatus"
+);
 
-const oilStatus =
-document.getElementById("oilStatus");
+const trend =
+document.getElementById(
+    "trend"
+);
+
+const momentum =
+document.getElementById(
+    "momentum"
+);
+
+const structure =
+document.getElementById(
+    "structure"
+);
+
+const rsi =
+document.getElementById(
+    "rsi"
+);
+
+const ema20 =
+document.getElementById(
+    "ema20"
+);
+
+const ema50 =
+document.getElementById(
+    "ema50"
+);
+
+const support =
+document.getElementById(
+    "support"
+);
+
+const resistance =
+document.getElementById(
+    "resistance"
+);
+
+const signal =
+document.getElementById(
+    "signal"
+);
+
+const confidence =
+document.getElementById(
+    "confidence"
+);
+
+const summary =
+document.getElementById(
+    "summary"
+);
 
 
-function setGoldStatus(text) {
+function updateAnalysis(data) {
 
-    goldStatus.innerText = text;
+    goldPrice.innerText =
+        Number(data.price)
+        .toFixed(3);
 
-    if (text === "LIVE") {
+    goldStatus.innerText =
+        "LIVE";
 
-        goldStatus.className =
-        "status live";
+    const a =
+        data.analysis;
 
-    } else {
+    trend.innerText =
+        a.trend;
 
-        goldStatus.className =
-        "status";
+    momentum.innerText =
+        a.momentum;
 
-    }
-}
+    structure.innerText =
+        a.structure;
 
+    rsi.innerText =
+        a.rsi === null
+        ? "--"
+        : a.rsi;
 
-function setOilStatus(text) {
+    ema20.innerText =
+        a.ema20 === null
+        ? "--"
+        : a.ema20;
 
-    oilStatus.innerText = text;
+    ema50.innerText =
+        a.ema50 === null
+        ? "--"
+        : a.ema50;
 
-    if (text === "LIVE") {
+    support.innerText =
+        a.support === null
+        ? "--"
+        : a.support;
 
-        oilStatus.className =
-        "status live";
+    resistance.innerText =
+        a.resistance === null
+        ? "--"
+        : a.resistance;
 
-    } else {
+    signal.innerText =
+        a.signal;
 
-        oilStatus.className =
-        "status";
+    confidence.innerText =
+        "Confidence: "
+        + a.confidence
+        + "%";
 
-    }
+    summary.innerText =
+        a.summary;
 }
 
 
 const stream =
-new EventSource("/stream");
+new EventSource(
+    "/stream"
+);
 
 
 stream.onopen = function() {
@@ -532,97 +1101,22 @@ stream.onopen = function() {
 };
 
 
-stream.onerror = function() {
-
-    console.log(
-        "TRADING-AI STREAM RECONNECTING"
-    );
-
-};
-
-
-stream.onmessage = function(event) {
+stream.onmessage =
+function(event) {
 
     try {
 
         const data =
-        JSON.parse(event.data);
-
-
-        if (data.type === "initial") {
-
-            if (data.gold.price !== null) {
-
-                goldPrice.innerText =
-                Number(data.gold.price)
-                .toFixed(3);
-
-            }
-
-            setGoldStatus(
-                data.gold.status
+            JSON.parse(
+                event.data
             );
 
+        if (
+            data.type ===
+            "gold_update"
+        ) {
 
-            if (data.oil.price !== null) {
-
-                oilPrice.innerText =
-                Number(data.oil.price)
-                .toFixed(3);
-
-            }
-
-            setOilStatus(
-                data.oil.status
-            );
-
-        }
-
-
-        if (data.type === "price") {
-
-            if (data.asset === "gold") {
-
-                goldPrice.innerText =
-                Number(data.price)
-                .toFixed(3);
-
-                setGoldStatus(
-                    "LIVE"
-                );
-
-            }
-
-
-            if (data.asset === "oil") {
-
-                oilPrice.innerText =
-                Number(data.price)
-                .toFixed(3);
-
-                setOilStatus(
-                    "LIVE"
-                );
-
-            }
-
-        }
-
-
-        if (data.type === "gold_status") {
-
-            setGoldStatus(
-                data.status
-            );
-
-        }
-
-
-        if (data.type === "oil_status") {
-
-            setOilStatus(
-                data.status
-            );
+            updateAnalysis(data);
 
         }
 
@@ -631,7 +1125,7 @@ stream.onmessage = function(event) {
     catch(error) {
 
         console.log(
-            "SSE ERROR:",
+            "STREAM ERROR:",
             error
         );
 
@@ -669,34 +1163,14 @@ def stream():
     client_queue = queue.Queue()
 
     with clients_lock:
-        clients.append(client_queue)
+
+        clients.append(
+            client_queue
+        )
 
     def generate():
 
         try:
-
-            with state_lock:
-
-                initial = {
-                    "type": "initial",
-                    "gold": dict(
-                        latest["gold"]
-                    ),
-                    "oil": dict(
-                        latest["oil"]
-                    )
-                }
-
-            initial_message = json.dumps(
-                initial,
-                separators=(",", ":")
-            )
-
-            yield (
-                "data: "
-                + initial_message
-                + "\n\n"
-            )
 
             while True:
 
@@ -714,7 +1188,9 @@ def stream():
 
                 except queue.Empty:
 
-                    yield ": keepalive\n\n"
+                    yield (
+                        ": keepalive\n\n"
+                    )
 
         finally:
 
@@ -727,12 +1203,22 @@ def stream():
                     )
 
     return Response(
+
         generate(),
-        mimetype="text/event-stream",
+
+        mimetype=
+        "text/event-stream",
+
         headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive"
+
+            "Cache-Control":
+            "no-cache",
+
+            "X-Accel-Buffering":
+            "no",
+
+            "Connection":
+            "keep-alive"
         }
     )
 
@@ -745,25 +1231,36 @@ def stream():
 def health():
 
     return {
+
         "status": "ok",
-        "live_engine": engine_started,
-        "api_key": bool(API_KEY)
+
+        "live_engine":
+        engine_started,
+
+        "api_key":
+        bool(API_KEY),
+
+        "gold_history":
+        len(history)
     }
 
 
 # =========================================================
-# LOCAL START
+# START
 # =========================================================
 
 if __name__ == "__main__":
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
             os.environ.get(
                 "PORT",
                 10000
             )
         ),
+
         threaded=True
     )
