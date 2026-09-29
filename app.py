@@ -1,4 +1,3 @@
-```python
 from flask import Flask, render_template_string, Response
 import os
 import json
@@ -11,12 +10,6 @@ import requests
 app = Flask(__name__)
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
-
-# Assets
-SYMBOLS = {
-    "XAU/USD": "gold",
-    "WTI/USD": "oil"
-}
 
 latest = {
     "gold": {
@@ -32,14 +25,14 @@ latest = {
 clients = []
 clients_lock = threading.Lock()
 state_lock = threading.Lock()
-
-engine_started = False
 engine_lock = threading.Lock()
 
+engine_started = False
 
-# ---------------------------------------------------------
+
+# =========================================================
 # BROADCAST
-# ---------------------------------------------------------
+# =========================================================
 
 def broadcast(data):
     message = json.dumps(data)
@@ -52,32 +45,11 @@ def broadcast(data):
                 pass
 
 
-# ---------------------------------------------------------
-# STATUS
-# ---------------------------------------------------------
-
-def update_status(status):
-    with state_lock:
-        latest["gold"]["status"] = status
-
-        # Oil status is managed separately by REST engine
-
-    broadcast({
-        "type": "status",
-        "status": status
-    })
-
-
-# ---------------------------------------------------------
+# =========================================================
 # UPDATE PRICE
-# ---------------------------------------------------------
+# =========================================================
 
-def update_price(symbol, price, timestamp=None):
-
-    asset = SYMBOLS.get(symbol)
-
-    if not asset:
-        return
+def update_price(asset, symbol, price):
 
     with state_lock:
         latest[asset]["price"] = price
@@ -88,45 +60,20 @@ def update_price(symbol, price, timestamp=None):
         "asset": asset,
         "symbol": symbol,
         "price": price,
-        "timestamp": timestamp or time.time()
+        "timestamp": time.time()
     })
 
 
-# ---------------------------------------------------------
-# GOLD WEBSOCKET HEARTBEAT
-# ---------------------------------------------------------
-
-def heartbeat(ws):
-
-    while True:
-
-        try:
-
-            time.sleep(10)
-
-            if ws.sock and ws.sock.connected:
-
-                ws.send(
-                    json.dumps({
-                        "action": "heartbeat"
-                    })
-                )
-
-        except Exception:
-            break
-
-
-# ---------------------------------------------------------
+# =========================================================
 # GOLD WEBSOCKET
-# ---------------------------------------------------------
+# =========================================================
 
-def websocket_worker():
+def gold_worker():
 
-    print("GOLD WEBSOCKET ENGINE STARTING", flush=True)
+    print("GOLD ENGINE STARTING", flush=True)
 
     if not API_KEY:
-
-        print("API KEY MISSING", flush=True)
+        print("TWELVE_DATA_API_KEY MISSING", flush=True)
 
         with state_lock:
             latest["gold"]["status"] = "API KEY MISSING"
@@ -141,7 +88,7 @@ def websocket_worker():
                 latest["gold"]["status"] = "CONNECTING"
 
             broadcast({
-                "type": "status",
+                "type": "gold_status",
                 "status": "CONNECTING"
             })
 
@@ -157,67 +104,55 @@ def websocket_worker():
                     flush=True
                 )
 
-                subscribe_message = {
+                subscribe = {
                     "action": "subscribe",
                     "params": {
                         "symbols": "XAU/USD"
                     }
                 }
 
-                ws.send(
-                    json.dumps(subscribe_message)
-                )
+                ws.send(json.dumps(subscribe))
 
                 with state_lock:
                     latest["gold"]["status"] = "CONNECTED"
 
                 broadcast({
-                    "type": "status",
+                    "type": "gold_status",
                     "status": "CONNECTED"
                 })
-
-                threading.Thread(
-                    target=heartbeat,
-                    args=(ws,),
-                    daemon=True
-                ).start()
 
             def on_message(ws, message):
 
                 try:
 
                     print(
-                        "TWELVE DATA MESSAGE:",
+                        "GOLD MESSAGE:",
                         message,
                         flush=True
                     )
 
                     data = json.loads(message)
 
-                    event = data.get("event")
-
-                    if event == "price":
+                    if data.get("event") == "price":
 
                         symbol = data.get("symbol")
-
                         price = data.get("price")
 
-                        timestamp = data.get("timestamp")
-
-                        if symbol and price is not None:
+                        if price is not None:
 
                             update_price(
-                                symbol,
-                                float(price),
-                                timestamp
+                                "gold",
+                                symbol or "XAU/USD",
+                                float(price)
                             )
 
-                    elif event == "subscribe-status":
+                    elif data.get("event") == "subscribe-status":
 
-                        broadcast({
-                            "type": "subscription",
-                            "data": data
-                        })
+                        print(
+                            "GOLD SUBSCRIPTION:",
+                            data,
+                            flush=True
+                        )
 
                 except Exception as error:
 
@@ -238,12 +173,12 @@ def websocket_worker():
                 with state_lock:
                     latest["gold"]["status"] = "RECONNECTING"
 
-            def on_close(ws, close_status_code, close_msg):
+            def on_close(ws, code, message):
 
                 print(
                     "GOLD WEBSOCKET CLOSED:",
-                    close_status_code,
-                    close_msg,
+                    code,
+                    message,
                     flush=True
                 )
 
@@ -256,11 +191,6 @@ def websocket_worker():
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close
-            )
-
-            print(
-                "CONNECTING TO TWELVE DATA GOLD",
-                flush=True
             )
 
             ws.run_forever(
@@ -279,21 +209,21 @@ def websocket_worker():
         time.sleep(5)
 
 
-# ---------------------------------------------------------
-# OIL REST API ENGINE
-# ---------------------------------------------------------
+# =========================================================
+# OIL REST API
+# =========================================================
 
-def oil_price_worker():
+def oil_worker():
 
     print(
-        "OIL REST API ENGINE STARTING",
+        "OIL REST ENGINE STARTING",
         flush=True
     )
 
     if not API_KEY:
 
         print(
-            "OIL API KEY MISSING",
+            "TWELVE_DATA_API_KEY MISSING",
             flush=True
         )
 
@@ -306,17 +236,13 @@ def oil_price_worker():
 
         try:
 
-            url = "https://api.twelvedata.com/price"
-
-            params = {
-                "symbol": "WTI/USD",
-                "apikey": API_KEY,
-                "dp": 5
-            }
-
             response = requests.get(
-                url,
-                params=params,
+                "https://api.twelvedata.com/price",
+                params={
+                    "symbol": "WTI/USD",
+                    "apikey": API_KEY,
+                    "dp": 3
+                },
                 timeout=15
             )
 
@@ -333,24 +259,21 @@ def oil_price_worker():
                 price = float(data["price"])
 
                 update_price(
+                    "oil",
                     "WTI/USD",
-                    price,
-                    time.time()
+                    price
                 )
-
-                with state_lock:
-                    latest["oil"]["status"] = "LIVE"
 
             else:
 
-                error_message = data.get(
+                message = data.get(
                     "message",
                     "OIL DATA UNAVAILABLE"
                 )
 
                 print(
                     "OIL API ERROR:",
-                    error_message,
+                    message,
                     flush=True
                 )
 
@@ -358,8 +281,8 @@ def oil_price_worker():
                     latest["oil"]["status"] = "UNAVAILABLE"
 
                 broadcast({
-                    "type": "oil-error",
-                    "message": error_message
+                    "type": "oil_status",
+                    "status": "UNAVAILABLE"
                 })
 
         except Exception as error:
@@ -373,14 +296,12 @@ def oil_price_worker():
             with state_lock:
                 latest["oil"]["status"] = "RECONNECTING"
 
-        # Basic plan has 8 API credits/minute.
-        # 15 seconds = maximum 4 requests/minute.
         time.sleep(15)
 
 
-# ---------------------------------------------------------
-# START ENGINES
-# ---------------------------------------------------------
+# =========================================================
+# START LIVE ENGINE
+# =========================================================
 
 def start_live_engine():
 
@@ -393,19 +314,15 @@ def start_live_engine():
 
         engine_started = True
 
-        gold_thread = threading.Thread(
-            target=websocket_worker,
+        threading.Thread(
+            target=gold_worker,
             daemon=True
-        )
+        ).start()
 
-        gold_thread.start()
-
-        oil_thread = threading.Thread(
-            target=oil_price_worker,
+        threading.Thread(
+            target=oil_worker,
             daemon=True
-        )
-
-        oil_thread.start()
+        ).start()
 
         print(
             "LIVE ENGINE STARTED",
@@ -413,19 +330,19 @@ def start_live_engine():
         )
 
 
-# ---------------------------------------------------------
-# START BEFORE REQUEST
-# ---------------------------------------------------------
+# =========================================================
+# START ENGINE BEFORE REQUEST
+# =========================================================
 
 @app.before_request
-def ensure_live_engine():
+def start_engine():
 
     start_live_engine()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HTML
-# ---------------------------------------------------------
+# =========================================================
 
 HTML = """
 <!DOCTYPE html>
@@ -434,6 +351,8 @@ HTML = """
 
 <head>
 
+<meta charset="UTF-8">
+
 <meta name="viewport"
 content="width=device-width, initial-scale=1">
 
@@ -441,27 +360,31 @@ content="width=device-width, initial-scale=1">
 
 <style>
 
+* {
+    box-sizing: border-box;
+}
+
 body {
     margin: 0;
     background: #05070b;
-    color: white;
+    color: #ffffff;
     font-family: Arial, sans-serif;
 }
 
 .header {
-    padding: 22px;
     text-align: center;
-    border-bottom: 1px solid #20242c;
+    padding: 25px 15px;
+    border-bottom: 1px solid #202631;
 }
 
 .logo {
-    font-size: 28px;
+    font-size: 30px;
     font-weight: bold;
 }
 
 .subtitle {
+    margin-top: 7px;
     color: #8d96a5;
-    margin-top: 6px;
 }
 
 .container {
@@ -474,7 +397,6 @@ body {
     display: grid;
     grid-template-columns:
     repeat(auto-fit, minmax(280px, 1fr));
-
     gap: 20px;
 }
 
@@ -482,31 +404,27 @@ body {
     background: #0d1118;
     border: 1px solid #202631;
     border-radius: 18px;
-    padding: 24px;
+    padding: 25px;
 }
 
 .asset {
-    font-size: 22px;
+    font-size: 21px;
     font-weight: bold;
 }
 
 .price {
-    font-size: 38px;
-    margin-top: 20px;
+    font-size: 40px;
     font-weight: bold;
+    margin-top: 22px;
 }
 
 .status {
     margin-top: 15px;
-    color: #8d96a5;
+    color: #f0b94b;
 }
 
 .live {
     color: #45e08b;
-}
-
-.waiting {
-    color: #f0b94b;
 }
 
 .footer {
@@ -543,18 +461,19 @@ Real-Time Market Intelligence
 🥇 Gold — XAU/USD
 </div>
 
-<div id="goldPrice"
+<div
+id="goldPrice"
 class="price">
 Waiting...
 </div>
 
-<div id="goldStatus"
-class="status waiting">
+<div
+id="goldStatus"
+class="status">
 Connecting...
 </div>
 
 </div>
-
 
 <div class="card">
 
@@ -562,13 +481,15 @@ Connecting...
 🛢️ Crude Oil — WTI
 </div>
 
-<div id="oilPrice"
+<div
+id="oilPrice"
 class="price">
 Waiting...
 </div>
 
-<div id="oilStatus"
-class="status waiting">
+<div
+id="oilStatus"
+class="status">
 Connecting...
 </div>
 
@@ -576,15 +497,11 @@ Connecting...
 
 </div>
 
-
 <div class="footer">
-
 LIVE MARKET ENGINE
-
 </div>
 
 </div>
-
 
 <script>
 
@@ -601,36 +518,26 @@ const oilStatus =
 document.getElementById("oilStatus");
 
 
-function setGoldStatus(text) {
+function goldLive(text) {
 
     goldStatus.innerText = text;
 
     if (text === "LIVE") {
-
-        goldStatus.className =
-        "status live";
-
+        goldStatus.className = "status live";
     } else {
-
-        goldStatus.className =
-        "status waiting";
+        goldStatus.className = "status";
     }
 }
 
 
-function setOilStatus(text) {
+function oilLive(text) {
 
     oilStatus.innerText = text;
 
     if (text === "LIVE") {
-
-        oilStatus.className =
-        "status live";
-
+        oilStatus.className = "status live";
     } else {
-
-        oilStatus.className =
-        "status waiting";
+        oilStatus.className = "status";
     }
 }
 
@@ -642,7 +549,7 @@ new EventSource("/stream");
 stream.onopen = function() {
 
     console.log(
-        "Trading-AI stream connected"
+        "Trading-AI STREAM CONNECTED"
     );
 
 };
@@ -651,7 +558,7 @@ stream.onopen = function() {
 stream.onerror = function() {
 
     console.log(
-        "Trading-AI stream reconnecting..."
+        "STREAM RECONNECTING"
     );
 
 };
@@ -683,14 +590,13 @@ stream.onmessage = function(event) {
 
             }
 
-            setGoldStatus(
+            goldLive(
                 data.gold.status
             );
 
-            setOilStatus(
+            oilLive(
                 data.oil.status
             );
-
         }
 
 
@@ -702,8 +608,7 @@ stream.onmessage = function(event) {
                 Number(data.price)
                 .toFixed(3);
 
-                setGoldStatus("LIVE");
-
+                goldLive("LIVE");
             }
 
 
@@ -713,28 +618,24 @@ stream.onmessage = function(event) {
                 Number(data.price)
                 .toFixed(3);
 
-                setOilStatus("LIVE");
-
+                oilLive("LIVE");
             }
-
         }
 
 
-        if (data.type === "status") {
+        if (data.type === "gold_status") {
 
-            setGoldStatus(
+            goldLive(
                 data.status
             );
-
         }
 
 
-        if (data.type === "oil-error") {
+        if (data.type === "oil_status") {
 
-            setOilStatus(
-                "DATA ERROR"
+            oilLive(
+                data.status
             );
-
         }
 
     }
@@ -742,7 +643,7 @@ stream.onmessage = function(event) {
     catch(error) {
 
         console.log(
-            "STREAM PARSE ERROR",
+            "STREAM ERROR:",
             error
         );
 
@@ -758,21 +659,19 @@ stream.onmessage = function(event) {
 """
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HOME
-# ---------------------------------------------------------
+# =========================================================
 
 @app.route("/")
 def home():
 
-    return render_template_string(
-        HTML
-    )
+    return render_template_string(HTML)
 
 
-# ---------------------------------------------------------
-# STREAM
-# ---------------------------------------------------------
+# =========================================================
+# LIVE STREAM
+# =========================================================
 
 @app.route("/stream")
 def stream():
@@ -780,10 +679,8 @@ def stream():
     client_queue = queue.Queue()
 
     with clients_lock:
+        clients.append(client_queue)
 
-        clients.append(
-            client_queue
-        )
 
     def generate():
 
@@ -791,7 +688,7 @@ def stream():
 
             with state_lock:
 
-                initial_state = {
+                initial = {
                     "type": "initial",
                     "gold": dict(
                         latest["gold"]
@@ -803,9 +700,10 @@ def stream():
 
             yield (
                 "data: "
-                + json.dumps(initial_state)
+                + json.dumps(initial)
                 + "\\n\\n"
             )
+
 
             while True:
 
@@ -830,29 +728,25 @@ def stream():
             with clients_lock:
 
                 if client_queue in clients:
-
                     clients.remove(
                         client_queue
                     )
 
+
     return Response(
-
         generate(),
-
         mimetype="text/event-stream",
-
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive"
         }
-
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HEALTH
-# ---------------------------------------------------------
+# =========================================================
 
 @app.route("/health")
 def health():
@@ -864,9 +758,9 @@ def health():
     }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # LOCAL START
-# ---------------------------------------------------------
+# =========================================================
 
 if __name__ == "__main__":
 
@@ -880,27 +774,3 @@ if __name__ == "__main__":
         ),
         threaded=True
     )
-```
-
-
-
-### Ek aur important change
-
-`requests` library use ki hai. Isliye GitHub ki **`requirements.txt`** me ye line honi chahiye:
-
-```text id="v1m2hx"
-Flask
-gunicorn
-websocket-client
-requests
-```
-
-**Start Command ko bilkul mat badalna:**
-
-```text
-gunicorn --workers 1 --threads 8 --timeout 0 --bind 0.0.0.0:$PORT app:app
-```
-
-Ab pehle **`app.py` save/commit** karo. Uske baad **`requirements.txt` save/commit** karo. Render automatically deploy karega.
-
-Oil API ko 15-second interval par rakha hai, yani maximum 4 oil requests/minute—tumhare 8 API credits/minute limit ke andar.
