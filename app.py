@@ -25,6 +25,9 @@ latest = {
         "invalidation": "--",
         "target": "--",
         "why": "Waiting for market data...",
+        "trend": "WAIT",
+        "momentum": "WAIT",
+        "structure": "WAIT",
         "trend_5m": "WAIT",
         "trend_15m": "WAIT",
         "trend_1h": "WAIT",
@@ -32,6 +35,8 @@ latest = {
         "rsi": None,
         "ema20": None,
         "ema50": None,
+        "buy_liquidity": None,
+        "sell_liquidity": None,
         "candles_5m": 0,
         "candles_15m": 0,
         "candles_1h": 0,
@@ -39,7 +44,7 @@ latest = {
     }
 }
 
-gold_prices = deque(maxlen=300)
+gold_prices = deque(maxlen=500)
 
 candles = {
     "5min": [],
@@ -48,7 +53,7 @@ candles = {
     "1day": []
 }
 
-lock = threading.Lock()
+lock = threading.RLock()
 
 
 def safe_float(value):
@@ -58,37 +63,71 @@ def safe_float(value):
         return None
 
 
-def ema(values, period):
-    if not values:
+def average(values):
+    clean = []
+
+    for value in values:
+        number = safe_float(value)
+        if number is not None:
+            clean.append(number)
+
+    if not clean:
         return None
 
-    values = [safe_float(v) for v in values]
-    values = [v for v in values if v is not None]
+    return sum(clean) / len(clean)
 
-    if len(values) < period:
+
+def candle_closes(data):
+    closes = []
+
+    for candle in data:
+        close = safe_float(candle.get("close"))
+
+        if close is not None:
+            closes.append(close)
+
+    return closes
+
+
+def ema(values, period):
+    clean = []
+
+    for value in values:
+        number = safe_float(value)
+
+        if number is not None:
+            clean.append(number)
+
+    if len(clean) < period:
         return None
 
     multiplier = 2 / (period + 1)
-    result = sum(values[:period]) / period
 
-    for price in values[period:]:
-        result = (price - result) * multiplier + result
+    result = sum(clean[:period]) / period
+
+    for price in clean[period:]:
+        result = ((price - result) * multiplier) + result
 
     return result
 
 
 def calculate_rsi(values, period=14):
-    values = [safe_float(v) for v in values]
-    values = [v for v in values if v is not None]
+    clean = []
 
-    if len(values) < period + 1:
+    for value in values:
+        number = safe_float(value)
+
+        if number is not None:
+            clean.append(number)
+
+    if len(clean) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+    for i in range(1, len(clean)):
+        change = clean[i] - clean[i - 1]
 
         if change > 0:
             gains.append(change)
@@ -101,41 +140,103 @@ def calculate_rsi(values, period=14):
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        avg_gain = (
+            ((avg_gain * (period - 1)) + gains[i])
+            / period
+        )
+
+        avg_loss = (
+            ((avg_loss * (period - 1)) + losses[i])
+            / period
+        )
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
     rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
 
 def trend_from_candles(data):
-    if not data or len(data) < 5:
+    closes = candle_closes(data)
+
+    if len(closes) < 10:
         return "WAIT"
 
-    closes = []
+    recent = average(closes[-5:])
+    previous = average(closes[-10:-5])
 
-    for candle in data:
-        close = safe_float(candle.get("close"))
-
-        if close is not None:
-            closes.append(close)
-
-    if len(closes) < 5:
+    if recent is None or previous is None:
         return "WAIT"
 
-    short = sum(closes[-3:]) / 3
-    long = sum(closes[-5:]) / 5
-
-    if short > long:
+    if recent > previous:
         return "BULLISH"
 
-    if short < long:
+    if recent < previous:
         return "BEARISH"
 
     return "WAIT"
+
+
+def momentum_from_prices(values):
+    if len(values) < 10:
+        return "WAIT"
+
+    recent = average(values[-5:])
+    previous = average(values[-10:-5])
+
+    if recent is None or previous is None:
+        return "WAIT"
+
+    if recent > previous:
+        return "BULLISH"
+
+    if recent < previous:
+        return "BEARISH"
+
+    return "WAIT"
+
+
+def structure_from_candles(data):
+    if len(data) < 10:
+        return "WAIT"
+
+    highs = []
+    lows = []
+
+    for candle in data[-10:]:
+        high = safe_float(candle.get("high"))
+        low = safe_float(candle.get("low"))
+
+        if high is not None:
+            highs.append(high)
+
+        if low is not None:
+            lows.append(low)
+
+    if len(highs) < 10 or len(lows) < 10:
+        return "WAIT"
+
+    recent_high = max(highs[-5:])
+    previous_high = max(highs[:5])
+
+    recent_low = min(lows[-5:])
+    previous_low = min(lows[:5])
+
+    if (
+        recent_high > previous_high
+        and recent_low > previous_low
+    ):
+        return "BULLISH"
+
+    if (
+        recent_high < previous_high
+        and recent_low < previous_low
+    ):
+        return "BEARISH"
+
+    return "MIXED"
 
 
 def liquidity_levels(data):
@@ -145,7 +246,7 @@ def liquidity_levels(data):
     highs = []
     lows = []
 
-    for candle in data[-30:]:
+    for candle in data[-40:]:
         high = safe_float(candle.get("high"))
         low = safe_float(candle.get("low"))
 
@@ -163,7 +264,8 @@ def liquidity_levels(data):
 
 def calculate_analysis(price=None):
     with lock:
-        price = price if price is not None else latest["gold"]["price"]
+        if price is None:
+            price = latest["gold"]["price"]
 
         if price is None:
             latest["gold"]["decision"] = "WAIT"
@@ -174,176 +276,345 @@ def calculate_analysis(price=None):
 
         live_history = list(gold_prices)
 
-        if len(live_history) < 5:
+        local_candles = {
+            key: list(value)
+            for key, value in candles.items()
+        }
+
+    if len(live_history) < 5:
+        with lock:
+            latest["gold"]["price"] = price
             latest["gold"]["decision"] = "WAIT"
             latest["gold"]["confidence"] = 0
             latest["gold"]["score"] = 0
             latest["gold"]["why"] = "Collecting live market data..."
-            latest["gold"]["price"] = price
-            return
 
-        trend_5m = trend_from_candles(candles["5min"])
-        trend_15m = trend_from_candles(candles["15min"])
-        trend_1h = trend_from_candles(candles["1h"])
-        trend_1d = trend_from_candles(candles["1day"])
+        return
 
-        closes_5m = []
+    trend_5m = trend_from_candles(
+        local_candles["5min"]
+    )
 
-        for candle in candles["5min"]:
-            close = safe_float(candle.get("close"))
-            if close is not None:
-                closes_5m.append(close)
+    trend_15m = trend_from_candles(
+        local_candles["15min"]
+    )
 
-        combined_prices = closes_5m[-80:] + live_history[-80:]
+    trend_1h = trend_from_candles(
+        local_candles["1h"]
+    )
 
-        ema20 = ema(combined_prices, 20)
-        ema50 = ema(combined_prices, 50)
-        rsi = calculate_rsi(combined_prices)
+    trend_1d = trend_from_candles(
+        local_candles["1day"]
+    )
 
-        score = 0
-        reasons = []
+    momentum = momentum_from_prices(
+        live_history
+    )
 
-        weights = {
-            "5m": 2,
-            "15m": 2,
-            "1h": 3,
-            "1d": 3
-        }
+    structure = structure_from_candles(
+        local_candles["5min"]
+    )
 
-        trends = {
-            "5m": trend_5m,
-            "15m": trend_15m,
-            "1h": trend_1h,
-            "1d": trend_1d
-        }
+    five_min_closes = candle_closes(
+        local_candles["5min"]
+    )
 
-        for tf, trend in trends.items():
-            weight = weights[tf]
+    combined_prices = (
+        five_min_closes[-150:]
+        + live_history[-150:]
+    )
 
-            if trend == "BULLISH":
-                score += weight
-                reasons.append(f"{tf} trend bullish")
+    ema20 = ema(
+        combined_prices,
+        20
+    )
 
-            elif trend == "BEARISH":
-                score -= weight
-                reasons.append(f"{tf} trend bearish")
+    ema50 = ema(
+        combined_prices,
+        50
+    )
 
-        if ema20 is not None:
-            if price > ema20:
-                score += 1
-                reasons.append("Price above EMA20")
-            else:
-                score -= 1
-                reasons.append("Price below EMA20")
+    rsi = calculate_rsi(
+        combined_prices,
+        14
+    )
 
-        if ema50 is not None:
-            if price > ema50:
-                score += 1
-                reasons.append("Price above EMA50")
-            else:
-                score -= 1
-                reasons.append("Price below EMA50")
+    liquidity_high, liquidity_low = liquidity_levels(
+        local_candles["5min"]
+    )
 
-        if rsi is not None:
-            if 55 <= rsi <= 75:
-                score += 1
-                reasons.append(f"RSI bullish zone ({rsi:.1f})")
+    score = 0
+    reasons = []
 
-            elif 25 <= rsi <= 45:
-                score -= 1
-                reasons.append(f"RSI bearish zone ({rsi:.1f})")
+    weights = {
+        "5m": 2,
+        "15m": 2,
+        "1h": 3,
+        "1d": 3
+    }
 
-            elif rsi > 75:
-                reasons.append(f"RSI overbought ({rsi:.1f})")
+    trends = {
+        "5m": trend_5m,
+        "15m": trend_15m,
+        "1h": trend_1h,
+        "1d": trend_1d
+    }
 
-            elif rsi < 25:
-                reasons.append(f"RSI oversold ({rsi:.1f})")
+    for timeframe, trend in trends.items():
+        weight = weights[timeframe]
 
-        liquidity_high, liquidity_low = liquidity_levels(candles["5min"])
+        if trend == "BULLISH":
+            score += weight
+            reasons.append(
+                f"{timeframe} trend bullish"
+            )
 
+        elif trend == "BEARISH":
+            score -= weight
+            reasons.append(
+                f"{timeframe} trend bearish"
+            )
+
+    if momentum == "BULLISH":
+        score += 1
+        reasons.append("Live momentum bullish")
+
+    elif momentum == "BEARISH":
+        score -= 1
+        reasons.append("Live momentum bearish")
+
+    if structure == "BULLISH":
+        score += 2
+        reasons.append("5m market structure bullish")
+
+    elif structure == "BEARISH":
+        score -= 2
+        reasons.append("5m market structure bearish")
+
+    if ema20 is not None:
+        if price > ema20:
+            score += 1
+            reasons.append("Price above EMA20")
+        elif price < ema20:
+            score -= 1
+            reasons.append("Price below EMA20")
+
+    if ema50 is not None:
+        if price > ema50:
+            score += 1
+            reasons.append("Price above EMA50")
+        elif price < ema50:
+            score -= 1
+            reasons.append("Price below EMA50")
+
+    if rsi is not None:
+        if 55 <= rsi <= 70:
+            score += 1
+            reasons.append(
+                f"RSI supportive ({rsi:.1f})"
+            )
+
+        elif 30 <= rsi <= 45:
+            score -= 1
+            reasons.append(
+                f"RSI bearish zone ({rsi:.1f})"
+            )
+
+        elif rsi > 70:
+            reasons.append(
+                f"RSI elevated ({rsi:.1f})"
+            )
+
+        elif rsi < 30:
+            reasons.append(
+                f"RSI weak/oversold ({rsi:.1f})"
+            )
+
+    decision = "WAIT"
+
+    if score >= 7:
+        decision = "BUY SIDE"
+
+    elif score <= -7:
+        decision = "SELL SIDE"
+
+    if (
+        trend_1d != "WAIT"
+        and trend_1h != "WAIT"
+        and trend_1d != trend_1h
+    ):
         decision = "WAIT"
+        reasons.append(
+            "1D and 1H trend conflict"
+        )
 
-        if score >= 6:
-            decision = "BUY SIDE"
+    if decision == "BUY SIDE":
+        entry = price
 
-        elif score <= -6:
-            decision = "SELL SIDE"
+        invalidation = (
+            liquidity_low
+            if liquidity_low is not None
+            else price * 0.995
+        )
 
-        if trend_1d != "WAIT" and trend_1h != "WAIT":
-            if trend_1d != trend_1h:
-                decision = "WAIT"
-                reasons.append("1D and 1H trend conflict")
+        target = (
+            liquidity_high
+            if liquidity_high is not None
+            else price * 1.01
+        )
 
-        if decision == "BUY SIDE":
-            entry = price
-            invalidation = liquidity_low if liquidity_low else price * 0.995
-            target = liquidity_high if liquidity_high else price * 1.01
+    elif decision == "SELL SIDE":
+        entry = price
 
-        elif decision == "SELL SIDE":
-            entry = price
-            invalidation = liquidity_high if liquidity_high else price * 1.005
-            target = liquidity_low if liquidity_low else price * 0.99
+        invalidation = (
+            liquidity_high
+            if liquidity_high is not None
+            else price * 1.005
+        )
 
-        else:
-            entry = "--"
-            invalidation = "--"
-            target = "--"
+        target = (
+            liquidity_low
+            if liquidity_low is not None
+            else price * 0.99
+        )
 
-        confidence = min(95, 50 + abs(score) * 4)
+    else:
+        entry = "--"
+        invalidation = "--"
+        target = "--"
 
-        if decision == "WAIT":
-            confidence = min(confidence, 60)
+    confidence = min(
+        95,
+        50 + abs(score) * 4
+    )
 
+    if decision == "WAIT":
+        confidence = min(
+            confidence,
+            60
+        )
+
+    if reasons:
+        why = " | ".join(
+            reasons[-8:]
+        )
+    else:
+        why = "Waiting for stronger market confirmation."
+
+    with lock:
         latest["gold"]["price"] = price
         latest["gold"]["decision"] = decision
         latest["gold"]["confidence"] = confidence
         latest["gold"]["score"] = score
+
         latest["gold"]["entry"] = (
-            round(entry, 4) if isinstance(entry, (int, float)) else entry
+            round(entry, 4)
+            if isinstance(entry, (int, float))
+            else entry
         )
+
         latest["gold"]["invalidation"] = (
             round(invalidation, 4)
             if isinstance(invalidation, (int, float))
             else invalidation
         )
+
         latest["gold"]["target"] = (
             round(target, 4)
             if isinstance(target, (int, float))
             else target
         )
 
+        latest["gold"]["trend"] = trend_1h
+        latest["gold"]["momentum"] = momentum
+        latest["gold"]["structure"] = structure
+
         latest["gold"]["trend_5m"] = trend_5m
         latest["gold"]["trend_15m"] = trend_15m
         latest["gold"]["trend_1h"] = trend_1h
         latest["gold"]["trend_1d"] = trend_1d
 
-        latest["gold"]["rsi"] = round(rsi, 2) if rsi is not None else None
-        latest["gold"]["ema20"] = round(ema20, 4) if ema20 is not None else None
-        latest["gold"]["ema50"] = round(ema50, 4) if ema50 is not None else None
+        latest["gold"]["rsi"] = (
+            round(rsi, 2)
+            if rsi is not None
+            else None
+        )
 
-        latest["gold"]["candles_5m"] = len(candles["5min"])
-        latest["gold"]["candles_15m"] = len(candles["15min"])
-        latest["gold"]["candles_1h"] = len(candles["1h"])
-        latest["gold"]["candles_1d"] = len(candles["1day"])
+        latest["gold"]["ema20"] = (
+            round(ema20, 4)
+            if ema20 is not None
+            else None
+        )
 
-        latest["gold"]["why"] = " | ".join(reasons[-6:])
+        latest["gold"]["ema50"] = (
+            round(ema50, 4)
+            if ema50 is not None
+            else None
+        )
+
+        latest["gold"]["buy_liquidity"] = (
+            round(liquidity_low, 4)
+            if liquidity_low is not None
+            else None
+        )
+
+        latest["gold"]["sell_liquidity"] = (
+            round(liquidity_high, 4)
+            if liquidity_high is not None
+            else None
+        )
+
+        latest["gold"]["candles_5m"] = len(
+            local_candles["5min"]
+        )
+
+        latest["gold"]["candles_15m"] = len(
+            local_candles["15min"]
+        )
+
+        latest["gold"]["candles_1h"] = len(
+            local_candles["1h"]
+        )
+
+        latest["gold"]["candles_1d"] = len(
+            local_candles["1day"]
+        )
+
+        latest["gold"]["why"] = why
 
 
 def gold_worker():
-    print("GOLD ENGINE STARTING", flush=True)
+    print(
+        "GOLD ENGINE STARTING",
+        flush=True
+    )
 
     while True:
         try:
             if not API_KEY:
                 with lock:
-                    latest["gold"]["status"] = "API KEY MISSING"
+                    latest["gold"]["status"] = (
+                        "API KEY MISSING"
+                    )
 
-                print("TWELVE_DATA_API_KEY MISSING", flush=True)
+                print(
+                    "TWELVE_DATA_API_KEY MISSING",
+                    flush=True
+                )
+
                 time.sleep(10)
                 continue
 
+            print(
+                "GOLD WS CONNECT ATTEMPT",
+                flush=True
+            )
+
             def on_open(ws):
-                print("TWELVE DATA GOLD CONNECTED", flush=True)
+                print(
+                    "TWELVE DATA GOLD CONNECTED",
+                    flush=True
+                )
 
                 subscribe_message = {
                     "action": "subscribe",
@@ -353,7 +624,11 @@ def gold_worker():
                     "apikey": API_KEY
                 }
 
-                ws.send(json.dumps(subscribe_message))
+                ws.send(
+                    json.dumps(
+                        subscribe_message
+                    )
+                )
 
                 print(
                     "GOLD SUBSCRIBE SENT:",
@@ -372,10 +647,22 @@ def gold_worker():
 
                     if isinstance(data, dict):
                         if "price" in data:
-                            price = safe_float(data.get("price"))
+                            price = safe_float(
+                                data.get("price")
+                            )
 
-                        elif "data" in data and isinstance(data["data"], dict):
-                            price = safe_float(data["data"].get("price"))
+                        elif (
+                            "data" in data
+                            and isinstance(
+                                data["data"],
+                                dict
+                            )
+                        ):
+                            price = safe_float(
+                                data["data"].get(
+                                    "price"
+                                )
+                            )
 
                     if price is None:
                         return
@@ -385,18 +672,24 @@ def gold_worker():
 
                         latest["gold"]["price"] = price
                         latest["gold"]["status"] = "LIVE"
-                        latest["gold"]["updated"] = time.strftime(
-                            "%Y-%m-%d %H:%M:%S"
+                        latest["gold"]["updated"] = (
+                            time.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
                         )
 
-                    print("GOLD PRICE:", price, flush=True)
+                    print(
+                        "GOLD PRICE:",
+                        price,
+                        flush=True
+                    )
 
                     calculate_analysis(price)
 
-                except Exception as e:
+                except Exception as error:
                     print(
                         "GOLD MESSAGE ERROR:",
-                        str(e),
+                        str(error),
                         flush=True
                     )
 
@@ -408,9 +701,15 @@ def gold_worker():
                 )
 
                 with lock:
-                    latest["gold"]["status"] = "RECONNECTING"
+                    latest["gold"]["status"] = (
+                        "RECONNECTING"
+                    )
 
-            def on_close(ws, close_status_code, close_msg):
+            def on_close(
+                ws,
+                close_status_code,
+                close_msg
+            ):
                 print(
                     "GOLD WEBSOCKET CLOSED:",
                     close_status_code,
@@ -419,7 +718,9 @@ def gold_worker():
                 )
 
                 with lock:
-                    latest["gold"]["status"] = "RECONNECTING"
+                    latest["gold"]["status"] = (
+                        "RECONNECTING"
+                    )
 
             ws = websocket.WebSocketApp(
                 "wss://ws.twelvedata.com/v1/quotes/price",
@@ -434,10 +735,10 @@ def gold_worker():
                 ping_timeout=10
             )
 
-        except Exception as e:
+        except Exception as error:
             print(
                 "GOLD WORKER ERROR:",
-                str(e),
+                str(error),
                 flush=True
             )
 
@@ -449,7 +750,9 @@ def fetch_candles(interval):
         if not API_KEY:
             return []
 
-        url = "https://api.twelvedata.com/time_series"
+        url = (
+            "https://api.twelvedata.com/time_series"
+        )
 
         params = {
             "symbol": GOLD_SYMBOL,
@@ -470,7 +773,8 @@ def fetch_candles(interval):
         )
 
         print(
-            f"CANDLE REQUEST {interval}: HTTP {response.status_code}",
+            f"CANDLE REQUEST {interval}: "
+            f"HTTP {response.status_code}",
             flush=True
         )
 
@@ -489,23 +793,27 @@ def fetch_candles(interval):
         values.reverse()
 
         print(
-            f"CANDLES {interval}: {len(values)}",
+            f"CANDLES {interval}: "
+            f"{len(values)}",
             flush=True
         )
 
         return values
 
-    except Exception as e:
+    except Exception as error:
         print(
             f"CANDLE EXCEPTION {interval}:",
-            str(e),
+            str(error),
             flush=True
         )
         return []
 
 
 def candle_worker():
-    print("CANDLE ENGINE STARTING", flush=True)
+    print(
+        "CANDLE ENGINE STARTING",
+        flush=True
+    )
 
     while True:
         try:
@@ -523,10 +831,10 @@ def candle_worker():
 
             calculate_analysis()
 
-        except Exception as e:
+        except Exception as error:
             print(
                 "CANDLE WORKER ERROR:",
-                str(e),
+                str(error),
                 flush=True
             )
 
@@ -537,166 +845,283 @@ HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
+<meta charset="UTF-8">
 
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
-    <title>Trading-AI</title>
+<title>Trading-AI</title>
 
-    <style>
-        * {
-            box-sizing: border-box;
-        }
+<style>
 
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: #07111f;
-            color: white;
-        }
+* {
+    box-sizing: border-box;
+}
 
-        .container {
-            max-width: 1000px;
-            margin: auto;
-            padding: 20px;
-        }
+body {
+    margin: 0;
+    background:
+        radial-gradient(
+            circle at top,
+            #142b44 0%,
+            #07111f 45%,
+            #030912 100%
+        );
+    color: #ffffff;
+    font-family: Arial, Helvetica, sans-serif;
+    min-height: 100vh;
+}
 
-        .header {
-            margin-bottom: 20px;
-        }
+.container {
+    max-width: 1100px;
+    margin: auto;
+    padding: 20px;
+}
 
-        .title {
-            font-size: 30px;
-            font-weight: bold;
-        }
+.header {
+    margin-bottom: 20px;
+}
 
-        .subtitle {
-            color: #9ca3af;
-            margin-top: 5px;
-        }
+.logo {
+    font-size: 30px;
+    font-weight: 800;
+}
 
-        .card {
-            background: #0d1b2a;
-            border: 1px solid #1e344b;
-            border-radius: 18px;
-            padding: 20px;
-            margin-bottom: 18px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-        }
+.subtitle {
+    color: #94a3b8;
+    margin-top: 6px;
+}
 
-        .gold-title {
-            font-size: 22px;
-            font-weight: bold;
-        }
+.card {
+    background: rgba(13, 27, 42, 0.96);
+    border: 1px solid #1d344c;
+    border-radius: 20px;
+    padding: 22px;
+    margin-bottom: 18px;
+    box-shadow:
+        0 15px 45px rgba(0, 0, 0, 0.28);
+}
 
-        .price {
-            font-size: 42px;
-            font-weight: bold;
-            margin: 12px 0;
-        }
+.asset-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+    flex-wrap: wrap;
+}
 
-        .live {
-            color: #43e97b;
-            font-weight: bold;
-        }
+.asset {
+    font-size: 23px;
+    font-weight: 800;
+}
 
-        .decision-box {
-            margin-top: 20px;
-            padding: 22px;
-            border-radius: 16px;
-            background: #111f31;
-            text-align: center;
-        }
+.live {
+    color: #4ade80;
+    font-weight: 700;
+    font-size: 14px;
+}
 
-        .decision {
-            font-size: 32px;
-            font-weight: bold;
-            margin: 8px 0;
-        }
+.price {
+    font-size: 44px;
+    font-weight: 800;
+    margin-top: 12px;
+}
 
-        .confidence {
-            font-size: 18px;
-            color: #cbd5e1;
-        }
+.source {
+    color: #64748b;
+    font-size: 13px;
+    margin-top: 5px;
+}
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 12px;
-            margin-top: 18px;
-        }
+.conclusion {
+    margin-top: 22px;
+    padding: 25px;
+    border-radius: 18px;
+    background:
+        linear-gradient(
+            135deg,
+            #102338,
+            #091727
+        );
+    text-align: center;
+    border: 1px solid #24415c;
+}
 
-        .metric {
-            background: #0a1624;
-            padding: 14px;
-            border-radius: 12px;
-        }
+.conclusion-title {
+    color: #94a3b8;
+    font-size: 13px;
+    letter-spacing: 1.5px;
+}
 
-        .metric-label {
-            color: #94a3b8;
-            font-size: 13px;
-        }
+.decision {
+    font-size: 34px;
+    font-weight: 900;
+    margin: 10px 0;
+}
 
-        .metric-value {
-            font-size: 18px;
-            font-weight: bold;
-            margin-top: 5px;
-        }
+.confidence {
+    color: #cbd5e1;
+    font-size: 17px;
+}
 
-        .why {
-            margin-top: 18px;
-            color: #cbd5e1;
-            line-height: 1.6;
-        }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-top: 18px;
+}
 
-        .trends {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 10px;
-            margin-top: 18px;
-        }
+.metric {
+    background: #091625;
+    border: 1px solid #182d43;
+    border-radius: 14px;
+    padding: 15px;
+}
 
-        .trend {
-            background: #0a1624;
-            padding: 12px;
-            border-radius: 12px;
-            text-align: center;
-        }
+.label {
+    color: #718096;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+}
 
-        .trend-name {
-            color: #94a3b8;
-            font-size: 12px;
-        }
+.value {
+    font-size: 19px;
+    font-weight: 800;
+    margin-top: 7px;
+}
 
-        .trend-value {
-            font-weight: bold;
-            margin-top: 5px;
-        }
+.section-title {
+    margin-top: 25px;
+    margin-bottom: 12px;
+    font-size: 18px;
+    font-weight: 800;
+}
 
-        .footer {
-            color: #64748b;
-            font-size: 12px;
-            text-align: center;
-            margin-top: 25px;
-        }
+.analysis-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+}
 
-        @media (max-width: 650px) {
-            .grid {
-                grid-template-columns: 1fr;
-            }
+.analysis {
+    background: #091625;
+    border: 1px solid #182d43;
+    padding: 15px;
+    border-radius: 14px;
+}
 
-            .trends {
-                grid-template-columns: repeat(2, 1fr);
-            }
+.analysis-name {
+    color: #718096;
+    font-size: 12px;
+}
 
-            .price {
-                font-size: 34px;
-            }
-        }
-    </style>
+.analysis-value {
+    font-size: 18px;
+    font-weight: 800;
+    margin-top: 6px;
+}
+
+.timeframes {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+}
+
+.timeframe {
+    background: #091625;
+    border-radius: 13px;
+    padding: 14px;
+    text-align: center;
+}
+
+.tf-name {
+    color: #718096;
+    font-size: 12px;
+}
+
+.tf-value {
+    font-weight: 800;
+    margin-top: 6px;
+}
+
+.reason {
+    color: #cbd5e1;
+    line-height: 1.7;
+    background: #091625;
+    border-radius: 14px;
+    padding: 16px;
+    border: 1px solid #182d43;
+}
+
+.liquidity-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+}
+
+.liquidity {
+    padding: 18px;
+    border-radius: 14px;
+    background: #091625;
+    border: 1px solid #182d43;
+}
+
+.liquidity-name {
+    color: #94a3b8;
+    font-size: 13px;
+}
+
+.liquidity-value {
+    font-size: 22px;
+    font-weight: 800;
+    margin-top: 7px;
+}
+
+.footer {
+    text-align: center;
+    color: #475569;
+    font-size: 12px;
+    padding: 15px 0 30px;
+}
+
+@media (max-width: 750px) {
+
+    .grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .analysis-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .timeframes {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .price {
+        font-size: 36px;
+    }
+}
+
+@media (max-width: 450px) {
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .analysis-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .liquidity-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+</style>
 </head>
 
 <body>
@@ -704,51 +1129,63 @@ HTML = """
 <div class="container">
 
     <div class="header">
-        <div class="title">
+
+        <div class="logo">
             Trading-AI
         </div>
 
         <div class="subtitle">
             Live Market Intelligence Engine
         </div>
+
     </div>
 
     <div class="card">
 
-        <div class="gold-title">
-            🥇 Gold — XAU/USD
+        <div class="asset-header">
+
+            <div class="asset">
+                🥇 Gold — XAU/USD
+            </div>
+
+            <div
+                class="live"
+                id="status"
+            >
+                Connecting...
+            </div>
+
         </div>
 
-        <div class="live" id="status">
-            Connecting...
-        </div>
-
-        <div class="price" id="price">
+        <div
+            class="price"
+            id="price"
+        >
             --
         </div>
 
-        <div>
-            Source:
-            <span id="source">
-                Twelve Data
-            </span>
+        <div class="source">
+            XAU/USD · Twelve Data
         </div>
 
-        <div class="decision-box">
+        <div class="conclusion">
 
-            <div>
+            <div class="conclusion-title">
                 AI MARKET CONCLUSION
             </div>
 
-            <div class="decision" id="decision">
+            <div
+                class="decision"
+                id="decision"
+            >
                 WAIT
             </div>
 
             <div class="confidence">
-                Confidence:
-                <span id="confidence">
-                    0
-                </span>%
+                CONFIDENCE:
+                <strong id="confidence">
+                    --
+                </strong>%
             </div>
 
         </div>
@@ -756,12 +1193,12 @@ HTML = """
         <div class="grid">
 
             <div class="metric">
-                <div class="metric-label">
+                <div class="label">
                     AI Score
                 </div>
 
                 <div
-                    class="metric-value"
+                    class="value"
                     id="score"
                 >
                     --
@@ -769,51 +1206,12 @@ HTML = """
             </div>
 
             <div class="metric">
-                <div class="metric-label">
-                    RSI
+                <div class="label">
+                    Entry Zone
                 </div>
 
                 <div
-                    class="metric-value"
-                    id="rsi"
-                >
-                    --
-                </div>
-            </div>
-
-            <div class="metric">
-                <div class="metric-label">
-                    EMA 20
-                </div>
-
-                <div
-                    class="metric-value"
-                    id="ema20"
-                >
-                    --
-                </div>
-            </div>
-
-            <div class="metric">
-                <div class="metric-label">
-                    EMA 50
-                </div>
-
-                <div
-                    class="metric-value"
-                    id="ema50"
-                >
-                    --
-                </div>
-            </div>
-
-            <div class="metric">
-                <div class="metric-label">
-                    Entry
-                </div>
-
-                <div
-                    class="metric-value"
+                    class="value"
                     id="entry"
                 >
                     --
@@ -821,12 +1219,12 @@ HTML = """
             </div>
 
             <div class="metric">
-                <div class="metric-label">
+                <div class="label">
                     Invalidation
                 </div>
 
                 <div
-                    class="metric-value"
+                    class="value"
                     id="invalidation"
                 >
                     --
@@ -834,100 +1232,251 @@ HTML = """
             </div>
 
             <div class="metric">
-                <div class="metric-label">
-                    Target
+                <div class="label">
+                    Target Liquidity
                 </div>
 
                 <div
-                    class="metric-value"
+                    class="value"
                     id="target"
                 >
                     --
                 </div>
             </div>
 
-            <div class="metric">
-                <div class="metric-label">
-                    Last Update
+        </div>
+
+        <div class="section-title">
+            WHY?
+        </div>
+
+        <div
+            class="reason"
+            id="why"
+        >
+            Waiting for market data...
+        </div>
+
+        <div class="section-title">
+            Market Analysis
+        </div>
+
+        <div class="analysis-grid">
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    TREND
                 </div>
 
                 <div
-                    class="metric-value"
-                    id="updated"
+                    class="analysis-value"
+                    id="trend"
                 >
                     --
                 </div>
+
+            </div>
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    MOMENTUM
+                </div>
+
+                <div
+                    class="analysis-value"
+                    id="momentum"
+                >
+                    --
+                </div>
+
+            </div>
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    STRUCTURE
+                </div>
+
+                <div
+                    class="analysis-value"
+                    id="structure"
+                >
+                    --
+                </div>
+
+            </div>
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    RSI
+                </div>
+
+                <div
+                    class="analysis-value"
+                    id="rsi"
+                >
+                    --
+                </div>
+
+            </div>
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    EMA 20
+                </div>
+
+                <div
+                    class="analysis-value"
+                    id="ema20"
+                >
+                    --
+                </div>
+
+            </div>
+
+            <div class="analysis">
+
+                <div class="analysis-name">
+                    EMA 50
+                </div>
+
+                <div
+                    class="analysis-value"
+                    id="ema50"
+                >
+                    --
+                </div>
+
             </div>
 
         </div>
 
-        <div class="trends">
+        <div class="section-title">
+            Timeframe Alignment
+        </div>
 
-            <div class="trend">
-                <div class="trend-name">
+        <div class="timeframes">
+
+            <div class="timeframe">
+
+                <div class="tf-name">
                     5 MIN
                 </div>
 
                 <div
-                    class="trend-value"
+                    class="tf-value"
                     id="trend5"
                 >
                     --
                 </div>
+
             </div>
 
-            <div class="trend">
-                <div class="trend-name">
+            <div class="timeframe">
+
+                <div class="tf-name">
                     15 MIN
                 </div>
 
                 <div
-                    class="trend-value"
+                    class="tf-value"
                     id="trend15"
                 >
                     --
                 </div>
+
             </div>
 
-            <div class="trend">
-                <div class="trend-name">
+            <div class="timeframe">
+
+                <div class="tf-name">
                     1 HOUR
                 </div>
 
                 <div
-                    class="trend-value"
+                    class="tf-value"
                     id="trend1h"
                 >
                     --
                 </div>
+
             </div>
 
-            <div class="trend">
-                <div class="trend-name">
+            <div class="timeframe">
+
+                <div class="tf-name">
                     1 DAY
                 </div>
 
                 <div
-                    class="trend-value"
+                    class="tf-value"
                     id="trend1d"
                 >
                     --
                 </div>
+
             </div>
 
         </div>
 
-        <div class="why">
-            <strong>AI Reasoning:</strong>
-            <span id="why">
-                Waiting for market data...
+        <div class="section-title">
+            Liquidity Map
+        </div>
+
+        <div class="liquidity-grid">
+
+            <div class="liquidity">
+
+                <div class="liquidity-name">
+                    BUY-SIDE
+                </div>
+
+                <div
+                    class="liquidity-value"
+                    id="buyLiquidity"
+                >
+                    Waiting...
+                </div>
+
+            </div>
+
+            <div class="liquidity">
+
+                <div class="liquidity-name">
+                    SELL-SIDE
+                </div>
+
+                <div
+                    class="liquidity-value"
+                    id="sellLiquidity"
+                >
+                    Waiting...
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="section-title">
+            System
+        </div>
+
+        <div class="source">
+            Last update:
+            <span id="updated">
+                --
             </span>
         </div>
 
     </div>
 
     <div class="footer">
-        Trading-AI analysis is informational and should not be treated as guaranteed financial advice.
+        Trading-AI analysis is informational.
+        Market outcomes are not guaranteed.
     </div>
 
 </div>
@@ -946,7 +1495,9 @@ async function updateState() {
         );
 
         if (!response.ok) {
-            throw new Error("State request failed");
+            throw new Error(
+                "API request failed"
+            );
         }
 
         const data = await response.json();
@@ -957,72 +1508,158 @@ async function updateState() {
             return;
         }
 
-        document.getElementById("status").innerText =
+        document.getElementById(
+            "status"
+        ).innerText =
             gold.status || "Connecting...";
 
-        document.getElementById("price").innerText =
-            gold.price !== null && gold.price !== undefined
-                ? Number(gold.price).toFixed(4)
+        document.getElementById(
+            "price"
+        ).innerText =
+            gold.price !== null &&
+            gold.price !== undefined
+                ? Number(
+                    gold.price
+                ).toFixed(4)
                 : "--";
 
-        document.getElementById("decision").innerText =
+        document.getElementById(
+            "decision"
+        ).innerText =
             gold.decision || "WAIT";
 
-        document.getElementById("confidence").innerText =
-            gold.confidence ?? 0;
+        document.getElementById(
+            "confidence"
+        ).innerText =
+            gold.confidence ?? "--";
 
-        document.getElementById("score").innerText =
+        document.getElementById(
+            "score"
+        ).innerText =
             gold.score ?? "--";
 
-        document.getElementById("rsi").innerText =
-            gold.rsi !== null && gold.rsi !== undefined
-                ? Number(gold.rsi).toFixed(2)
-                : "--";
-
-        document.getElementById("ema20").innerText =
-            gold.ema20 !== null && gold.ema20 !== undefined
-                ? Number(gold.ema20).toFixed(4)
-                : "--";
-
-        document.getElementById("ema50").innerText =
-            gold.ema50 !== null && gold.ema50 !== undefined
-                ? Number(gold.ema50).toFixed(4)
-                : "--";
-
-        document.getElementById("entry").innerText =
+        document.getElementById(
+            "entry"
+        ).innerText =
             gold.entry ?? "--";
 
-        document.getElementById("invalidation").innerText =
+        document.getElementById(
+            "invalidation"
+        ).innerText =
             gold.invalidation ?? "--";
 
-        document.getElementById("target").innerText =
+        document.getElementById(
+            "target"
+        ).innerText =
             gold.target ?? "--";
 
-        document.getElementById("updated").innerText =
-            gold.updated || "--";
+        document.getElementById(
+            "why"
+        ).innerText =
+            gold.why || "Waiting...";
 
-        document.getElementById("trend5").innerText =
+        document.getElementById(
+            "trend"
+        ).innerText =
+            gold.trend || "--";
+
+        document.getElementById(
+            "momentum"
+        ).innerText =
+            gold.momentum || "--";
+
+        document.getElementById(
+            "structure"
+        ).innerText =
+            gold.structure || "--";
+
+        document.getElementById(
+            "rsi"
+        ).innerText =
+            gold.rsi !== null &&
+            gold.rsi !== undefined
+                ? Number(
+                    gold.rsi
+                ).toFixed(2)
+                : "--";
+
+        document.getElementById(
+            "ema20"
+        ).innerText =
+            gold.ema20 !== null &&
+            gold.ema20 !== undefined
+                ? Number(
+                    gold.ema20
+                ).toFixed(4)
+                : "--";
+
+        document.getElementById(
+            "ema50"
+        ).innerText =
+            gold.ema50 !== null &&
+            gold.ema50 !== undefined
+                ? Number(
+                    gold.ema50
+                ).toFixed(4)
+                : "--";
+
+        document.getElementById(
+            "trend5"
+        ).innerText =
             gold.trend_5m || "--";
 
-        document.getElementById("trend15").innerText =
+        document.getElementById(
+            "trend15"
+        ).innerText =
             gold.trend_15m || "--";
 
-        document.getElementById("trend1h").innerText =
+        document.getElementById(
+            "trend1h"
+        ).innerText =
             gold.trend_1h || "--";
 
-        document.getElementById("trend1d").innerText =
+        document.getElementById(
+            "trend1d"
+        ).innerText =
             gold.trend_1d || "--";
 
-        document.getElementById("why").innerText =
-            gold.why || "Waiting for market data...";
+        document.getElementById(
+            "buyLiquidity"
+        ).innerText =
+            gold.buy_liquidity !== null &&
+            gold.buy_liquidity !== undefined
+                ? Number(
+                    gold.buy_liquidity
+                ).toFixed(4)
+                : "Waiting...";
+
+        document.getElementById(
+            "sellLiquidity"
+        ).innerText =
+            gold.sell_liquidity !== null &&
+            gold.sell_liquidity !== undefined
+                ? Number(
+                    gold.sell_liquidity
+                ).toFixed(4)
+                : "Waiting...";
+
+        document.getElementById(
+            "updated"
+        ).innerText =
+            gold.updated || "--";
 
     } catch (error) {
 
-        document.getElementById("status").innerText =
+        document.getElementById(
+            "status"
+        ).innerText =
             "Connection retrying...";
 
+        console.log(
+            "STATE ERROR:",
+            error
+        );
     }
-
 }
 
 updateState();
@@ -1048,7 +1685,9 @@ def home():
 def api_state():
     with lock:
         data = {
-            "gold": dict(latest["gold"])
+            "gold": dict(
+                latest["gold"]
+            )
         }
 
     return jsonify(data)
@@ -1065,7 +1704,10 @@ def health():
 
 
 def start_engines():
-    print("LIVE ENGINE STARTING", flush=True)
+    print(
+        "LIVE ENGINE STARTING",
+        flush=True
+    )
 
     threading.Thread(
         target=gold_worker,
@@ -1077,7 +1719,10 @@ def start_engines():
         daemon=True
     ).start()
 
-    print("LIVE ENGINE STARTED", flush=True)
+    print(
+        "LIVE ENGINE STARTED",
+        flush=True
+    )
 
 
 start_engines()
