@@ -15,8 +15,11 @@ app = Flask(__name__)
 # ============================================================
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
-
 GOLD_SYMBOL = "XAU/USD"
+
+# ============================================================
+# GLOBAL DATA
+# ============================================================
 
 latest = {
     "gold": {
@@ -30,9 +33,11 @@ latest = {
         "decision": "WAIT",
         "confidence": None,
         "score": None,
+
         "entry": None,
         "invalidation": None,
         "target": None,
+
         "why": "Waiting for market data...",
 
         "trend_5m": "WAIT",
@@ -51,10 +56,8 @@ latest = {
     }
 }
 
-# Recent live prices
 gold_prices = deque(maxlen=300)
 
-# Candle storage
 candles = {
     "5min": [],
     "15min": [],
@@ -84,7 +87,7 @@ def ema(values, period):
     result = sum(values[:period]) / period
 
     for price in values[period:]:
-        result = (price - result) * multiplier + result
+        result = ((price - result) * multiplier) + result
 
     return result
 
@@ -106,17 +109,26 @@ def calculate_rsi(values, period=14):
             gains.append(0)
             losses.append(abs(change))
 
+    if len(gains) < period:
+        return None
+
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        avg_gain = (
+            (avg_gain * (period - 1)) + gains[i]
+        ) / period
+
+        avg_loss = (
+            (avg_loss * (period - 1)) + losses[i]
+        ) / period
 
     if avg_loss == 0:
         return 100.0
 
     rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
 
@@ -128,6 +140,7 @@ def trend_from_candles(data):
 
     for candle in data:
         close = safe_float(candle.get("close"))
+
         if close is not None:
             closes.append(close)
 
@@ -135,8 +148,12 @@ def trend_from_candles(data):
         return "WAIT"
 
     recent = closes[-5:]
+
     first = recent[0]
     last = recent[-1]
+
+    if first == 0:
+        return "WAIT"
 
     change_pct = ((last - first) / first) * 100
 
@@ -169,7 +186,10 @@ def liquidity_levels(data):
     if not highs or not lows:
         return None, None
 
-    return max(highs[-30:]), min(lows[-30:])
+    recent_highs = highs[-30:]
+    recent_lows = lows[-30:]
+
+    return max(recent_highs), min(recent_lows)
 
 
 # ============================================================
@@ -177,93 +197,117 @@ def liquidity_levels(data):
 # ============================================================
 
 def calculate_analysis(price):
+    if price is None:
+        return
+
     with lock:
         c5 = list(candles["5min"])
         c15 = list(candles["15min"])
         c1h = list(candles["1h"])
         c1d = list(candles["1day"])
-
         history = list(gold_prices)
-
-    if price is None:
-        return
 
     if len(history) < 5:
         with lock:
             latest["gold"]["decision"] = "WAIT"
             latest["gold"]["confidence"] = 0
             latest["gold"]["score"] = 0
-            latest["gold"]["why"] = "Collecting live market data..."
+            latest["gold"]["why"] = (
+                "Collecting live market data..."
+            )
+
         return
+
+    # --------------------------------------------------------
+    # MULTI-TIMEFRAME TREND
+    # --------------------------------------------------------
 
     trend5 = trend_from_candles(c5)
     trend15 = trend_from_candles(c15)
     trend1h = trend_from_candles(c1h)
     trend1d = trend_from_candles(c1d)
 
+    # --------------------------------------------------------
+    # PRICE SERIES
+    # --------------------------------------------------------
+
     closes = []
 
     for candle in c5:
         close = safe_float(candle.get("close"))
+
         if close is not None:
             closes.append(close)
 
     closes.extend(history)
 
-    # Keep unique-ish chronological values
-    closes = closes[-150:]
+    closes = closes[-200:]
 
     ema20_value = ema(closes, 20)
     ema50_value = ema(closes, 50)
     rsi_value = calculate_rsi(closes)
 
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
     score = 0
     reasons = []
 
-    # --------------------------------------------------------
-    # MULTI TIMEFRAME TREND
-    # --------------------------------------------------------
-
-    trend_weights = {
-        "1d": 3,
-        "1h": 3,
-        "15m": 2,
-        "5m": 2
-    }
-
     trends = {
-        "1d": trend1d,
-        "1h": trend1h,
-        "15m": trend15,
-        "5m": trend5
+        "1D": trend1d,
+        "1H": trend1h,
+        "15M": trend15,
+        "5M": trend5
     }
 
-    for tf, weight in trend_weights.items():
+    weights = {
+        "1D": 3,
+        "1H": 3,
+        "15M": 2,
+        "5M": 2
+    }
 
-        if trends[tf] == "BULLISH":
+    for timeframe, weight in weights.items():
+
+        trend = trends[timeframe]
+
+        if trend == "BULLISH":
             score += weight
-            reasons.append(f"{tf.upper()} bullish")
+            reasons.append(
+                f"{timeframe} bullish"
+            )
 
-        elif trends[tf] == "BEARISH":
+        elif trend == "BEARISH":
             score -= weight
-            reasons.append(f"{tf.upper()} bearish")
+            reasons.append(
+                f"{timeframe} bearish"
+            )
 
     # --------------------------------------------------------
-    # EMA
+    # EMA20
     # --------------------------------------------------------
 
     if ema20_value is not None:
+
         if price > ema20_value:
             score += 1
             reasons.append("Price above EMA20")
+
         else:
             score -= 1
             reasons.append("Price below EMA20")
 
+    # --------------------------------------------------------
+    # EMA50
+    # --------------------------------------------------------
+
     if ema50_value is not None:
+
         if price > ema50_value:
             score += 1
             reasons.append("Price above EMA50")
+
         else:
             score -= 1
             reasons.append("Price below EMA50")
@@ -274,11 +318,11 @@ def calculate_analysis(price):
 
     if rsi_value is not None:
 
-        if rsi_value > 55 and rsi_value < 75:
+        if 55 < rsi_value < 75:
             score += 1
             reasons.append("RSI bullish")
 
-        elif rsi_value < 45 and rsi_value > 25:
+        elif 25 < rsi_value < 45:
             score -= 1
             reasons.append("RSI bearish")
 
@@ -294,29 +338,44 @@ def calculate_analysis(price):
 
     liquidity_high, liquidity_low = liquidity_levels(c5)
 
+    entry = price
     target = None
     invalidation = None
-    entry = None
 
-    if liquidity_high is not None and liquidity_low is not None:
-
-        distance_high = abs(liquidity_high - price)
-        distance_low = abs(price - liquidity_low)
+    if (
+        liquidity_high is not None
+        and liquidity_low is not None
+    ):
 
         if score > 0:
+
             target = liquidity_high
             invalidation = liquidity_low
-            entry = price
 
         elif score < 0:
+
             target = liquidity_low
             invalidation = liquidity_high
-            entry = price
 
         else:
-            target = liquidity_high if distance_high < distance_low else liquidity_low
-            invalidation = liquidity_low if target == liquidity_high else liquidity_high
-            entry = price
+
+            high_distance = abs(
+                liquidity_high - price
+            )
+
+            low_distance = abs(
+                price - liquidity_low
+            )
+
+            if high_distance <= low_distance:
+
+                target = liquidity_high
+                invalidation = liquidity_low
+
+            else:
+
+                target = liquidity_low
+                invalidation = liquidity_high
 
     # --------------------------------------------------------
     # FINAL DECISION
@@ -330,60 +389,99 @@ def calculate_analysis(price):
     elif score <= -6:
         decision = "SELL SIDE"
 
-    # Strong higher timeframe conflict = WAIT
+    # Higher timeframe conflict
     if (
         trend1d != "WAIT"
         and trend1h != "WAIT"
         and trend1d != trend1h
     ):
         decision = "WAIT"
-        reasons.append("Higher timeframe conflict")
+        reasons.append(
+            "1D / 1H higher-timeframe conflict"
+        )
 
-    confidence = min(95, 50 + abs(score) * 4)
+    confidence = min(
+        95,
+        50 + (abs(score) * 4)
+    )
 
     if decision == "WAIT":
-        confidence = min(confidence, 60)
+        confidence = min(
+            confidence,
+            60
+        )
 
     if not reasons:
-        reasons.append("Insufficient confirmation")
+        reasons.append(
+            "Insufficient confirmation"
+        )
 
-    why = " • ".join(reasons[-6:])
+    why = " • ".join(
+        reasons[-6:]
+    )
+
+    # --------------------------------------------------------
+    # SAVE ANALYSIS
+    # --------------------------------------------------------
 
     with lock:
+
         latest["gold"].update({
+
             "price": price,
+
             "decision": decision,
+
             "confidence": confidence,
+
             "score": score,
+
             "entry": entry,
+
             "invalidation": invalidation,
+
             "target": target,
+
             "why": why,
 
             "trend_5m": trend5,
+
             "trend_15m": trend15,
+
             "trend_1h": trend1h,
+
             "trend_1d": trend1d,
 
             "rsi": rsi_value,
+
             "ema20": ema20_value,
+
             "ema50": ema50_value
         })
 
 
 # ============================================================
-# TWELVE DATA GOLD WEBSOCKET
+# GOLD WEBSOCKET
 # ============================================================
 
 def gold_worker():
 
-    print("GOLD ENGINE STARTING", flush=True)
+    print(
+        "GOLD ENGINE STARTING",
+        flush=True
+    )
 
     if not API_KEY:
-        print("TWELVE_DATA_API_KEY MISSING", flush=True)
+
+        print(
+            "TWELVE_DATA_API_KEY MISSING",
+            flush=True
+        )
 
         with lock:
-            latest["gold"]["status"] = "API KEY MISSING"
+            latest["gold"]["status"] = (
+                "API KEY MISSING"
+            )
 
         return
 
@@ -391,122 +489,24 @@ def gold_worker():
 
         try:
 
-            print("GOLD WS CONNECT ATTEMPT", flush=True)
+            print(
+                "GOLD WS CONNECT ATTEMPT",
+                flush=True
+            )
 
             ws = websocket.create_connection(
                 "wss://ws.twelvedata.com/v1/quotes/price",
                 timeout=30
             )
 
-            print("TWELVE DATA GOLD CONNECTED", flush=True)
+            print(
+                "TWELVE DATA GOLD CONNECTED",
+                flush=True
+            )
 
             subscribe_message = {
                 "action": "subscribe",
                 "params": {
                     "symbols": GOLD_SYMBOL
                 },
-                "apikey": API_KEY
-            }
-
-            ws.send(json.dumps(subscribe_message))
-
-            print(
-                f"GOLD SUBSCRIBE SENT: {GOLD_SYMBOL}",
-                flush=True
-            )
-
-            with lock:
-                latest["gold"]["status"] = "LIVE"
-
-            while True:
-
-                message = ws.recv()
-
-                if not message:
-                    continue
-
-                try:
-                    data = json.loads(message)
-                except Exception:
-                    continue
-
-                event = data.get("event")
-
-                if event == "subscribe-status":
-
-                    print(
-                        f"GOLD WS: {data}",
-                        flush=True
-                    )
-
-                    continue
-
-                price = safe_float(data.get("price"))
-
-                if price is None:
-                    continue
-
-                print(
-                    f"GOLD PRICE: {price}",
-                    flush=True
-                )
-
-                with lock:
-
-                    previous = latest["gold"]["price"]
-
-                    latest["gold"]["previous_price"] = previous
-                    latest["gold"]["price"] = price
-                    latest["gold"]["status"] = "LIVE"
-                    latest["gold"]["updated"] = time.time()
-
-                    gold_prices.append(price)
-
-                calculate_analysis(price)
-
-        except Exception as e:
-
-            print(
-                f"GOLD WEBSOCKET ERROR: {e}",
-                flush=True
-            )
-
-            with lock:
-                latest["gold"]["status"] = "RECONNECTING"
-
-            time.sleep(3)
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def fetch_candles(interval):
-
-    if not API_KEY:
-        return []
-
-    try:
-
-        url = "https://api.twelvedata.com/time_series"
-
-        params = {
-            "symbol": GOLD_SYMBOL,
-            "interval": interval,
-            "outputsize": 100,
-            "apikey": API_KEY
-        }
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=15
-        )
-
-        print(
-            f"CANDLE REQUEST {interval}: HTTP {response.status_code}",
-            flush=True
-        )
-
-        data = response.jso
 ```
