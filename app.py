@@ -5,21 +5,20 @@ import time
 import threading
 import queue
 import websocket
-import requests
 
-app = Flask(**name**)
+app = Flask(__name__)
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
 latest = {
-"gold": {
-"price": None,
-"status": "CONNECTING"
-},
-"oil": {
-"price": None,
-"status": "UNAVAILABLE"
-}
+    "gold": {
+        "price": None,
+        "status": "CONNECTING"
+    },
+    "oil": {
+        "price": None,
+        "status": "DATA SOURCE REQUIRED"
+    }
 }
 
 clients = []
@@ -29,310 +28,288 @@ engine_lock = threading.Lock()
 
 engine_started = False
 
+
 # =========================================================
-
 # BROADCAST
-
 # =========================================================
 
 def broadcast(data):
 
-```
-message = json.dumps(
-    data,
-    separators=(",", ":")
-)
+    message = json.dumps(
+        data,
+        separators=(",", ":")
+    )
 
-with clients_lock:
+    with clients_lock:
 
-    for client_queue in list(clients):
+        for client_queue in list(clients):
 
-        try:
-            client_queue.put_nowait(message)
+            try:
+                client_queue.put_nowait(message)
 
-        except Exception:
-            pass
-```
+            except Exception:
+                pass
+
 
 # =========================================================
-
 # UPDATE PRICE
-
 # =========================================================
 
 def update_price(asset, symbol, price):
 
-```
-with state_lock:
+    with state_lock:
 
-    latest[asset]["price"] = price
-    latest[asset]["status"] = "LIVE"
+        latest[asset]["price"] = price
+        latest[asset]["status"] = "LIVE"
 
-broadcast({
-    "type": "price",
-    "asset": asset,
-    "symbol": symbol,
-    "price": price,
-    "timestamp": time.time()
-})
-```
+    broadcast({
+        "type": "price",
+        "asset": asset,
+        "symbol": symbol,
+        "price": price,
+        "timestamp": time.time()
+    })
+
 
 # =========================================================
-
 # GOLD WEBSOCKET
-
 # =========================================================
 
 def gold_worker():
 
-```
-print(
-    "GOLD ENGINE STARTING",
-    flush=True
-)
-
-if not API_KEY:
-
     print(
-        "TWELVE_DATA_API_KEY MISSING",
+        "GOLD ENGINE STARTING",
         flush=True
     )
 
-    with state_lock:
-        latest["gold"]["status"] = "API KEY MISSING"
+    if not API_KEY:
 
-    return
-
-while True:
-
-    try:
-
-        with state_lock:
-            latest["gold"]["status"] = "CONNECTING"
-
-        broadcast({
-            "type": "gold_status",
-            "status": "CONNECTING"
-        })
-
-        url = (
-            "wss://ws.twelvedata.com/v1/quotes/price?apikey="
-            + API_KEY
+        print(
+            "TWELVE_DATA_API_KEY MISSING",
+            flush=True
         )
 
-        def on_open(ws):
+        with state_lock:
+            latest["gold"]["status"] = "API KEY MISSING"
 
-            print(
-                "TWELVE DATA GOLD CONNECTED",
-                flush=True
-            )
+        return
 
-            subscribe = {
-                "action": "subscribe",
-                "params": {
-                    "symbols": "XAU/USD"
-                }
-            }
+    while True:
 
-            ws.send(
-                json.dumps(subscribe)
-            )
+        try:
 
             with state_lock:
-                latest["gold"]["status"] = "CONNECTED"
+                latest["gold"]["status"] = "CONNECTING"
 
             broadcast({
                 "type": "gold_status",
-                "status": "CONNECTED"
+                "status": "CONNECTING"
             })
 
-        def on_message(ws, message):
+            url = (
+                "wss://ws.twelvedata.com/v1/quotes/price?apikey="
+                + API_KEY
+            )
 
-            try:
+            def on_open(ws):
 
                 print(
-                    "GOLD MESSAGE:",
-                    message,
+                    "TWELVE DATA GOLD CONNECTED",
                     flush=True
                 )
 
-                data = json.loads(message)
+                subscribe = {
+                    "action": "subscribe",
+                    "params": {
+                        "symbols": "XAU/USD"
+                    }
+                }
 
-                event = data.get("event")
+                ws.send(
+                    json.dumps(subscribe)
+                )
 
-                if event == "price":
+                with state_lock:
+                    latest["gold"]["status"] = "CONNECTED"
 
-                    symbol = data.get(
-                        "symbol",
-                        "XAU/USD"
-                    )
+                broadcast({
+                    "type": "gold_status",
+                    "status": "CONNECTED"
+                })
 
-                    price = data.get("price")
+            def on_message(ws, message):
 
-                    if price is not None:
-
-                        update_price(
-                            "gold",
-                            symbol,
-                            float(price)
-                        )
-
-                elif event == "subscribe-status":
+                try:
 
                     print(
-                        "GOLD SUBSCRIPTION:",
-                        data,
+                        "GOLD MESSAGE:",
+                        message,
                         flush=True
                     )
 
-            except Exception as error:
+                    data = json.loads(message)
+
+                    if data.get("event") == "price":
+
+                        symbol = data.get(
+                            "symbol",
+                            "XAU/USD"
+                        )
+
+                        price = data.get("price")
+
+                        if price is not None:
+
+                            update_price(
+                                "gold",
+                                symbol,
+                                float(price)
+                            )
+
+                    elif data.get("event") == "subscribe-status":
+
+                        print(
+                            "GOLD SUBSCRIPTION:",
+                            data,
+                            flush=True
+                        )
+
+                except Exception as error:
+
+                    print(
+                        "GOLD MESSAGE ERROR:",
+                        error,
+                        flush=True
+                    )
+
+            def on_error(ws, error):
 
                 print(
-                    "GOLD MESSAGE ERROR:",
+                    "GOLD WEBSOCKET ERROR:",
                     error,
                     flush=True
                 )
 
-        def on_error(ws, error):
+                with state_lock:
+                    latest["gold"]["status"] = "RECONNECTING"
+
+                broadcast({
+                    "type": "gold_status",
+                    "status": "RECONNECTING"
+                })
+
+            def on_close(ws, code, message):
+
+                print(
+                    "GOLD WEBSOCKET CLOSED:",
+                    code,
+                    message,
+                    flush=True
+                )
+
+                with state_lock:
+                    latest["gold"]["status"] = "RECONNECTING"
+
+                broadcast({
+                    "type": "gold_status",
+                    "status": "RECONNECTING"
+                })
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
 
             print(
-                "GOLD WEBSOCKET ERROR:",
+                "CONNECTING TO TWELVE DATA GOLD",
+                flush=True
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception as error:
+
+            print(
+                "GOLD ENGINE ERROR:",
                 error,
                 flush=True
             )
 
-            with state_lock:
-                latest["gold"]["status"] = "RECONNECTING"
+        time.sleep(5)
 
-            broadcast({
-                "type": "gold_status",
-                "status": "RECONNECTING"
-            })
-
-        def on_close(ws, code, message):
-
-            print(
-                "GOLD WEBSOCKET CLOSED:",
-                code,
-                message,
-                flush=True
-            )
-
-            with state_lock:
-                latest["gold"]["status"] = "RECONNECTING"
-
-            broadcast({
-                "type": "gold_status",
-                "status": "RECONNECTING"
-            })
-
-        ws = websocket.WebSocketApp(
-            url,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-
-        print(
-            "CONNECTING TO TWELVE DATA GOLD",
-            flush=True
-        )
-
-        ws.run_forever(
-            ping_interval=20,
-            ping_timeout=10
-        )
-
-    except Exception as error:
-
-        print(
-            "GOLD ENGINE ERROR:",
-            error,
-            flush=True
-        )
-
-    time.sleep(5)
-```
 
 # =========================================================
-
-# OIL STATUS
-
+# OIL PLACEHOLDER
 # =========================================================
 
 def oil_worker():
 
-```
-print(
-    "OIL ENGINE: TWELVE DATA WTI NOT AVAILABLE ON CURRENT PLAN",
-    flush=True
-)
+    print(
+        "OIL ENGINE STARTING",
+        flush=True
+    )
 
-with state_lock:
-    latest["oil"]["status"] = "DATA SOURCE REQUIRED"
+    with state_lock:
+        latest["oil"]["status"] = "DATA SOURCE REQUIRED"
 
-broadcast({
-    "type": "oil_status",
-    "status": "DATA SOURCE REQUIRED"
-})
-```
+    broadcast({
+        "type": "oil_status",
+        "status": "DATA SOURCE REQUIRED"
+    })
+
 
 # =========================================================
-
 # START LIVE ENGINE
-
 # =========================================================
 
 def start_live_engine():
 
-```
-global engine_started
+    global engine_started
 
-with engine_lock:
+    with engine_lock:
 
-    if engine_started:
-        return
+        if engine_started:
+            return
 
-    engine_started = True
+        engine_started = True
 
-    threading.Thread(
-        target=gold_worker,
-        daemon=True
-    ).start()
+        threading.Thread(
+            target=gold_worker,
+            daemon=True
+        ).start()
 
-    threading.Thread(
-        target=oil_worker,
-        daemon=True
-    ).start()
+        threading.Thread(
+            target=oil_worker,
+            daemon=True
+        ).start()
 
-    print(
-        "LIVE ENGINE STARTED",
-        flush=True
-    )
-```
+        print(
+            "LIVE ENGINE STARTED",
+            flush=True
+        )
+
 
 # =========================================================
-
 # START ENGINE
-
 # =========================================================
 
 @app.before_request
 def start_engine():
 
-```
-start_live_engine()
-```
+    start_live_engine()
+
 
 # =========================================================
-
 # HTML
-
 # =========================================================
 
 HTML = """
-
 <!DOCTYPE html>
 
 <html>
@@ -355,7 +332,7 @@ content="width=device-width, initial-scale=1">
 body {
     margin: 0;
     background: #05070b;
-    color: white;
+    color: #ffffff;
     font-family: Arial, sans-serif;
 }
 
@@ -478,7 +455,7 @@ Waiting...
 <div
 id="oilStatus"
 class="status">
-Checking...
+DATA SOURCE REQUIRED
 </div>
 
 </div>
@@ -558,18 +535,13 @@ stream.onopen = function() {
 stream.onerror = function() {
 
     console.log(
-        "TRADING-AI STREAM ERROR / RECONNECTING"
+        "TRADING-AI STREAM RECONNECTING"
     );
 
 };
 
 
 stream.onmessage = function(event) {
-
-    console.log(
-        "SSE DATA:",
-        event.data
-    );
 
     try {
 
@@ -659,7 +631,7 @@ stream.onmessage = function(event) {
     catch(error) {
 
         console.log(
-            "SSE JSON ERROR:",
+            "SSE ERROR:",
             error
         );
 
@@ -674,152 +646,124 @@ stream.onmessage = function(event) {
 </html>
 """
 
+
 # =========================================================
-
 # HOME
-
 # =========================================================
 
 @app.route("/")
 def home():
 
-```
-return render_template_string(
-    HTML
-)
-```
+    return render_template_string(
+        HTML
+    )
+
 
 # =========================================================
-
-# SSE STREAM
-
+# STREAM
 # =========================================================
 
 @app.route("/stream")
 def stream():
 
-```
-client_queue = queue.Queue()
+    client_queue = queue.Queue()
 
-with clients_lock:
+    with clients_lock:
+        clients.append(client_queue)
 
-    clients.append(
-        client_queue
+    def generate():
+
+        try:
+
+            with state_lock:
+
+                initial = {
+                    "type": "initial",
+                    "gold": dict(
+                        latest["gold"]
+                    ),
+                    "oil": dict(
+                        latest["oil"]
+                    )
+                }
+
+            initial_message = json.dumps(
+                initial,
+                separators=(",", ":")
+            )
+
+            yield (
+                "data: "
+                + initial_message
+                + "\n\n"
+            )
+
+            while True:
+
+                try:
+
+                    message = client_queue.get(
+                        timeout=15
+                    )
+
+                    yield (
+                        "data: "
+                        + message
+                        + "\n\n"
+                    )
+
+                except queue.Empty:
+
+                    yield ": keepalive\n\n"
+
+        finally:
+
+            with clients_lock:
+
+                if client_queue in clients:
+
+                    clients.remove(
+                        client_queue
+                    )
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
     )
 
 
-def generate():
-
-    try:
-
-        with state_lock:
-
-            initial = {
-                "type": "initial",
-                "gold": dict(
-                    latest["gold"]
-                ),
-                "oil": dict(
-                    latest["oil"]
-                )
-            }
-
-
-        initial_message = json.dumps(
-            initial,
-            separators=(",", ":")
-        )
-
-        # IMPORTANT:
-        # SSE requires a REAL blank line after each event.
-        yield (
-            "data: "
-            + initial_message
-            + "\n\n"
-        )
-
-
-        while True:
-
-            try:
-
-                message = client_queue.get(
-                    timeout=15
-                )
-
-                # IMPORTANT:
-                # Use actual newline characters.
-                yield (
-                    "data: "
-                    + message
-                    + "\n\n"
-                )
-
-            except queue.Empty:
-
-                # SSE keepalive comment
-                yield ": keepalive\n\n"
-
-    finally:
-
-        with clients_lock:
-
-            if client_queue in clients:
-
-                clients.remove(
-                    client_queue
-                )
-
-
-return Response(
-
-    generate(),
-
-    mimetype="text/event-stream",
-
-    headers={
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive"
-    }
-
-)
-```
-
 # =========================================================
-
 # HEALTH
-
 # =========================================================
 
 @app.route("/health")
 def health():
 
-```
-return {
-    "status": "ok",
-    "live_engine": engine_started,
-    "api_key": bool(API_KEY)
-}
-```
+    return {
+        "status": "ok",
+        "live_engine": engine_started,
+        "api_key": bool(API_KEY)
+    }
+
 
 # =========================================================
-
 # LOCAL START
-
 # =========================================================
 
-if **name** == "**main**":
+if __name__ == "__main__":
 
-```
-app.run(
-    host="0.0.0.0",
-    port=int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    ),
-    threaded=True
-)
-```
+    app.run(
+        host="0.0.0.0",
+        port=int(
+            os.environ.get(
+                "PORT",
+                10000
+            )
+        ),
+        threaded=True
+    )
