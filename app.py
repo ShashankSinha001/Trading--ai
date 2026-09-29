@@ -10,7 +10,6 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
-# Twelve Data commodity symbols
 SYMBOLS = {
     "XAU/USD": "gold",
     "WTI/USD": "oil"
@@ -19,11 +18,11 @@ SYMBOLS = {
 latest = {
     "gold": {
         "price": None,
-        "status": "Connecting..."
+        "status": "CONNECTING"
     },
     "oil": {
         "price": None,
-        "status": "Connecting..."
+        "status": "CONNECTING"
     }
 }
 
@@ -31,22 +30,30 @@ clients = []
 clients_lock = threading.Lock()
 state_lock = threading.Lock()
 
+engine_started = False
+engine_lock = threading.Lock()
+
 
 def broadcast(data):
     message = json.dumps(data)
 
     with clients_lock:
-        dead_clients = []
-
-        for client_queue in clients:
+        for client_queue in list(clients):
             try:
                 client_queue.put_nowait(message)
             except Exception:
-                dead_clients.append(client_queue)
+                pass
 
-        for dead in dead_clients:
-            if dead in clients:
-                clients.remove(dead)
+
+def update_status(status):
+    with state_lock:
+        latest["gold"]["status"] = status
+        latest["oil"]["status"] = status
+
+    broadcast({
+        "type": "status",
+        "status": status
+    })
 
 
 def update_price(symbol, price, timestamp=None):
@@ -69,22 +76,9 @@ def update_price(symbol, price, timestamp=None):
     })
 
 
-def update_status(status):
-
-    with state_lock:
-        latest["gold"]["status"] = status
-        latest["oil"]["status"] = status
-
-    broadcast({
-        "type": "status",
-        "status": status
-    })
-
-
 def heartbeat(ws):
 
     while True:
-
         try:
             time.sleep(10)
 
@@ -162,14 +156,22 @@ def websocket_worker():
                             "data": data
                         })
 
-                except Exception:
-                    pass
+                except Exception as error:
+
+                    print("MESSAGE ERROR:", error)
 
             def on_error(ws, error):
 
+                print("WEBSOCKET ERROR:", error)
                 update_status("CONNECTION ERROR")
 
             def on_close(ws, close_status_code, close_msg):
+
+                print(
+                    "WEBSOCKET CLOSED:",
+                    close_status_code,
+                    close_msg
+                )
 
                 update_status("RECONNECTING")
 
@@ -186,8 +188,9 @@ def websocket_worker():
                 ping_timeout=10
             )
 
-        except Exception:
+        except Exception as error:
 
+            print("ENGINE ERROR:", error)
             update_status("RECONNECTING")
 
         time.sleep(5)
@@ -195,12 +198,29 @@ def websocket_worker():
 
 def start_live_engine():
 
-    thread = threading.Thread(
-        target=websocket_worker,
-        daemon=True
-    )
+    global engine_started
 
-    thread.start()
+    with engine_lock:
+
+        if engine_started:
+            return
+
+        engine_started = True
+
+        thread = threading.Thread(
+            target=websocket_worker,
+            daemon=True
+        )
+
+        thread.start()
+
+        print("LIVE ENGINE STARTED")
+
+
+# IMPORTANT:
+# Gunicorn imports this file instead of running it directly.
+# Therefore the live engine must start during import.
+start_live_engine()
 
 
 HTML = """
@@ -330,7 +350,6 @@ Connecting to live market...
 
 </div>
 
-
 <div class="card">
 
 <h2>🛢️ Crude Oil — WTI</h2>
@@ -345,13 +364,13 @@ Waiting...
 
 <div class="row">
 <span class="label">Connection</span>
+
 <span class="status" id="oilStatus">
 Connecting...
 </span>
 </div>
 
 </div>
-
 
 <div class="card">
 
@@ -366,14 +385,16 @@ Waiting...
 </div>
 
 <div class="row">
+
 <span class="label">Connection</span>
+
 <span class="status" id="goldStatus">
 Connecting...
 </span>
-</div>
 
 </div>
 
+</div>
 
 <div class="info">
 
@@ -384,11 +405,9 @@ Price updates are pushed automatically — no page refresh required.
 
 </div>
 
-
 <script>
 
 const stream = new EventSource("/stream");
-
 
 stream.onopen = function() {
 
@@ -408,6 +427,58 @@ stream.onmessage = function(event) {
     try {
 
         const data = JSON.parse(event.data);
+
+        if (data.type === "initial") {
+
+            if (
+                data.oil &&
+                data.oil.price !== null
+            ) {
+
+                document.getElementById(
+                    "oilPrice"
+                ).innerText =
+                    "$" +
+                    Number(data.oil.price)
+                    .toLocaleString(
+                        undefined,
+                        {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                        }
+                    );
+
+                document.getElementById(
+                    "oilStatus"
+                ).innerText = "LIVE";
+
+            }
+
+            if (
+                data.gold &&
+                data.gold.price !== null
+            ) {
+
+                document.getElementById(
+                    "goldPrice"
+                ).innerText =
+                    "$" +
+                    Number(data.gold.price)
+                    .toLocaleString(
+                        undefined,
+                        {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                        }
+                    );
+
+                document.getElementById(
+                    "goldStatus"
+                ).innerText = "LIVE";
+
+            }
+
+        }
 
 
         if (data.type === "price") {
@@ -473,7 +544,8 @@ stream.onerror = function() {
 
     document.getElementById(
         "connectionStatus"
-    ).innerText = "LIVE CONNECTION LOST — RECONNECTING";
+    ).innerText =
+        "LIVE CONNECTION LOST — RECONNECTING";
 
     document.getElementById(
         "statusDot"
@@ -482,7 +554,6 @@ stream.onerror = function() {
 };
 
 </script>
-
 
 </body>
 
@@ -516,7 +587,11 @@ def stream():
                     "oil": latest["oil"]
                 }
 
-            yield "data: " + json.dumps(initial_state) + "\\n\\n"
+            yield (
+                "data: "
+                + json.dumps(initial_state)
+                + "\n\n"
+            )
 
             while True:
 
@@ -526,11 +601,15 @@ def stream():
                         timeout=15
                     )
 
-                    yield "data: " + message + "\\n\\n"
+                    yield (
+                        "data: "
+                        + message
+                        + "\n\n"
+                    )
 
                 except queue.Empty:
 
-                    yield ": keepalive\\n\\n"
+                    yield ": keepalive\n\n"
 
         finally:
 
@@ -538,6 +617,7 @@ def stream():
 
                 if client_queue in clients:
                     clients.remove(client_queue)
+
 
     return Response(
         generate(),
@@ -555,13 +635,12 @@ def health():
 
     return {
         "status": "ok",
-        "live_engine": True
+        "live_engine": True,
+        "api_key": bool(API_KEY)
     }
 
 
 if __name__ == "__main__":
-
-    start_live_engine()
 
     app.run(
         host="0.0.0.0",
