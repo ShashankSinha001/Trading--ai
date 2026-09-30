@@ -6,7 +6,8 @@ import threading
 import queue
 import requests
 import websocket
-from datetime import datetime, timezone
+
+from signal_engine import Candle, generate_signal, signal_to_dict
 
 app = Flask(__name__)
 
@@ -18,15 +19,22 @@ API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
 
 GOLD_SYMBOL = "XAU/USD"
 
-# Your current Twelve Data Basic plan does not provide WTI/USD.
-# Keep this False so Oil cannot break the Gold connection.
+# Current Twelve Data plan does not provide WTI/USD.
 OIL_ENABLED = False
 OIL_SYMBOL = "WTI/USD"
 
 WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
 
 CANDLE_INTERVALS = [
-    "1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week", "1month"
+    "1min",
+    "5min",
+    "15min",
+    "30min",
+    "1h",
+    "4h",
+    "1day",
+    "1week",
+    "1month"
 ]
 
 # =========================================================
@@ -34,11 +42,9 @@ CANDLE_INTERVALS = [
 # =========================================================
 
 lock = threading.RLock()
-
 workers_started = False
 
 clients = []
-
 clients_lock = threading.Lock()
 
 state = {
@@ -69,18 +75,24 @@ state = {
         "score": 0,
 
         "connection": "CONNECTING",
-
         "updated": None,
 
         "timeframes": {
+            "1min": {},
             "5min": {},
             "15min": {},
+            "30min": {},
             "1h": {},
-            "1day": {}
+            "4h": {},
+            "1day": {},
+            "1week": {},
+            "1month": {}
         },
 
         "candles": {},
+
         "signal_history": [],
+
         "trade_plan": {
             "signal": "WAIT",
             "entry": None,
@@ -92,6 +104,11 @@ state = {
             "invalidation": None,
             "reason": []
         },
+
+        "ai_reasons": [],
+        "ai_warnings": [],
+        "breakout": "UNKNOWN",
+        "liquidity_analysis": "UNKNOWN",
 
         "error": None
     },
@@ -123,7 +140,6 @@ state = {
         "score": 0,
 
         "connection": "PLAN LIMIT",
-
         "updated": None,
 
         "timeframes": {},
@@ -152,9 +168,6 @@ def number(value):
 
 
 def broadcast():
-    """
-    Send the latest state to every connected browser.
-    """
     with lock:
         payload = json.dumps(
             state,
@@ -189,9 +202,7 @@ def update_gold_price(price):
 
     broadcast()
 
-    print(
-        f"STATE UPDATED: GOLD = {price}"
-    )
+    print(f"STATE UPDATED: GOLD = {price}")
 
 
 # =========================================================
@@ -257,16 +268,14 @@ def rsi(values, period=14):
 # TWELVE DATA CANDLES
 # =========================================================
 
-def get_candles(
-    symbol,
-    interval,
-    outputsize=100
-):
+def get_candles(symbol, interval, outputsize=100):
+
     if not API_KEY:
         print("ERROR: TWELVE_DATA_API_KEY missing")
         return []
 
     try:
+
         response = requests.get(
             "https://api.twelvedata.com/time_series",
             params={
@@ -301,17 +310,18 @@ def get_candles(
         if not values:
             return []
 
-        # Twelve Data normally returns newest first.
         values = list(reversed(values))
 
         return values
 
     except Exception as exc:
+
         print(
             "CANDLE ERROR:",
             interval,
             repr(exc)
         )
+
         return []
 
 
@@ -320,6 +330,7 @@ def get_candles(
 # =========================================================
 
 def analyze_timeframe(candles):
+
     if not candles:
         return {}
 
@@ -329,17 +340,9 @@ def analyze_timeframe(candles):
 
     for candle in candles:
 
-        close = number(
-            candle.get("close")
-        )
-
-        high = number(
-            candle.get("high")
-        )
-
-        low = number(
-            candle.get("low")
-        )
+        close = number(candle.get("close"))
+        high = number(candle.get("high"))
+        low = number(candle.get("low"))
 
         if close is not None:
             closes.append(close)
@@ -355,20 +358,10 @@ def analyze_timeframe(candles):
 
     current = closes[-1]
 
-    ema20 = ema(
-        closes,
-        20
-    )
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
 
-    ema50 = ema(
-        closes,
-        50
-    )
-
-    current_rsi = rsi(
-        closes,
-        14
-    )
+    current_rsi = rsi(closes, 14)
 
     recent_highs = highs[-20:]
     recent_lows = lows[-20:]
@@ -399,7 +392,6 @@ def analyze_timeframe(candles):
     else:
         trend = "NEUTRAL"
 
-
     if current_rsi is None:
         momentum = "NEUTRAL"
 
@@ -412,18 +404,12 @@ def analyze_timeframe(candles):
     else:
         momentum = "NEUTRAL"
 
-
     recent = closes[-10:]
 
     if len(recent) >= 10:
 
-        old_average = sum(
-            recent[:5]
-        ) / 5
-
-        new_average = sum(
-            recent[-5:]
-        ) / 5
+        old_average = sum(recent[:5]) / 5
+        new_average = sum(recent[-5:]) / 5
 
         if new_average > old_average:
             structure = "HIGHER"
@@ -437,9 +423,8 @@ def analyze_timeframe(candles):
     else:
         structure = "RANGE"
 
-
     # -----------------------------------------------------
-    # Liquidity / sweep detection
+    # Liquidity
     # -----------------------------------------------------
 
     liquidity_high = (
@@ -458,32 +443,24 @@ def analyze_timeframe(candles):
 
     if len(candles) >= 3:
 
-        previous_high = max(
-            highs[-3:-1]
-        )
-
-        previous_low = min(
-            lows[-3:-1]
-        )
+        previous_high = max(highs[-3:-1])
+        previous_low = min(lows[-3:-1])
 
         latest_high = highs[-1]
         latest_low = lows[-1]
         latest_close = closes[-1]
 
-        # High liquidity sweep
         if (
             latest_high > previous_high
             and latest_close < previous_high
         ):
             sweep = "HIGH SWEEP"
 
-        # Low liquidity sweep
         elif (
             latest_low < previous_low
             and latest_close > previous_low
         ):
             sweep = "LOW SWEEP"
-
 
     return {
         "price": current,
@@ -539,89 +516,385 @@ def analyze_timeframe(candles):
 
 
 # =========================================================
-# AI MARKET ENGINE
+# CONVERT DATA FOR NEW SIGNAL ENGINE
+# =========================================================
+
+def convert_to_engine_candles(candles):
+
+    result = []
+
+    for candle in candles:
+
+        try:
+
+            result.append(
+                Candle(
+                    open=float(
+                        candle.get("open", 0)
+                    ),
+
+                    high=float(
+                        candle.get("high", 0)
+                    ),
+
+                    low=float(
+                        candle.get("low", 0)
+                    ),
+
+                    close=float(
+                        candle.get("close", 0)
+                    ),
+
+                    volume=float(
+                        candle.get("volume", 0) or 0
+                    )
+                )
+            )
+
+        except Exception:
+            continue
+
+    return result
+
+
+# =========================================================
+# NEW MULTI-FACTOR AI ENGINE
 # =========================================================
 
 def build_ai_analysis(timeframes, live_price):
-    """Explainable local Trading-AI scoring engine, bounded to -10..+10."""
-    score = 0
-    reasons = []
-    five = timeframes.get("5min", {})
-    fifteen = timeframes.get("15min", {})
-    one_hour = timeframes.get("1h", {})
-    four_hour = timeframes.get("4h", {})
 
-    def add(condition, points, reason):
-        nonlocal score
-        if condition:
-            score += points
-            reasons.append(reason)
+    """
+    Multi-factor Trading-AI engine.
 
-    add(five.get("trend") == "BULLISH", 2, "5m trend bullish")
-    add(five.get("trend") == "BEARISH", -2, "5m trend bearish")
-    add(five.get("momentum") == "BUYING", 1, "5m momentum buying")
-    add(five.get("momentum") == "SELLING", -1, "5m momentum selling")
-    add(fifteen.get("trend") == "BULLISH", 2, "15m trend bullish")
-    add(fifteen.get("trend") == "BEARISH", -2, "15m trend bearish")
-    add(fifteen.get("structure") == "HIGHER", 1, "15m structure higher")
-    add(fifteen.get("structure") == "LOWER", -1, "15m structure lower")
-    add(one_hour.get("trend") == "BULLISH", 2, "1H trend bullish")
-    add(one_hour.get("trend") == "BEARISH", -2, "1H trend bearish")
-    add(four_hour.get("trend") == "BULLISH", 1, "4H trend bullish")
-    add(four_hour.get("trend") == "BEARISH", -1, "4H trend bearish")
+    Uses:
+        Trend
+        Market structure
+        Momentum
+        RSI
+        EMA
+        Liquidity
+        Breakout
+        Higher timeframe confirmation
+        Conflict detection
+    """
 
-    sweep = five.get("sweep", "NONE")
-    add(sweep == "LOW SWEEP", 1, "5m low-liquidity sweep")
-    add(sweep == "HIGH SWEEP", -1, "5m high-liquidity sweep")
+    five_raw = (
+        timeframes
+        .get("5min", {})
+        .get("candles", [])
+    )
 
-    score = max(-10, min(10, score))
-    decision = "BUY" if score >= 6 else "SELL" if score <= -6 else "WAIT"
-    confidence = max(50, min(95, 50 + abs(score) * 5))
-    return {"signal": decision, "confidence": confidence, "score": score, "reasons": reasons}
+    fifteen_raw = (
+        timeframes
+        .get("15min", {})
+        .get("candles", [])
+    )
+
+    one_hour_raw = (
+        timeframes
+        .get("1h", {})
+        .get("candles", [])
+    )
+
+    five = convert_to_engine_candles(
+        five_raw
+    )
+
+    fifteen = convert_to_engine_candles(
+        fifteen_raw
+    )
+
+    one_hour = convert_to_engine_candles(
+        one_hour_raw
+    )
+
+    if len(five) < 60:
+
+        return {
+            "signal": "WAIT",
+            "confidence": 25,
+            "score": 0,
+
+            "reasons": [
+                "Waiting for enough 5m market data."
+            ],
+
+            "warnings": [
+                "Multi-factor engine needs more candles."
+            ],
+
+            "trend": "UNKNOWN",
+            "momentum": "UNKNOWN",
+            "structure": "UNKNOWN",
+            "liquidity": "UNKNOWN",
+            "breakout": "UNKNOWN"
+        }
+
+    result = generate_signal(
+        candles=five,
+
+        higher_timeframe_candles=(
+            fifteen
+            if len(fifteen) >= 60
+            else None
+        )
+    )
+
+    data = signal_to_dict(result)
+
+    # -----------------------------------------------------
+    # 1H CONFIRMATION
+    # -----------------------------------------------------
+
+    if len(one_hour) >= 60:
+
+        one_hour_result = generate_signal(
+            candles=one_hour
+        )
+
+        higher_trend = one_hour_result.trend
+
+        if (
+            data["decision"] == "BUY"
+            and higher_trend == "BEARISH"
+        ):
+
+            data["decision"] = "WAIT"
+
+            data["confidence"] = min(
+                data["confidence"],
+                60
+            )
+
+            data["warnings"].append(
+                "1H trend conflicts with BUY setup."
+            )
+
+        elif (
+            data["decision"] == "SELL"
+            and higher_trend == "BULLISH"
+        ):
+
+            data["decision"] = "WAIT"
+
+            data["confidence"] = min(
+                data["confidence"],
+                60
+            )
+
+            data["warnings"].append(
+                "1H trend conflicts with SELL setup."
+            )
+
+    return {
+        "signal": data["decision"],
+        "confidence": data["confidence"],
+        "score": data["score"],
+
+        "reasons": data["reasons"],
+        "warnings": data["warnings"],
+
+        "trend": data["trend"],
+        "momentum": data["momentum"],
+        "structure": data["structure"],
+        "liquidity": data["liquidity"],
+        "breakout": data["breakout"]
+    }
 
 
-def build_trade_plan(timeframes, live_price, ai):
-    """Transparent planning framework; targets are rule-based, not guarantees."""
-    if live_price is None or ai["signal"] == "WAIT":
-        return {"signal":"WAIT","entry":None,"stop_loss":None,"target_1":None,
-                "target_2":None,"target_3":None,"risk_reward":None,
-                "invalidation":None,"reason":ai.get("reasons",[])}
+# =========================================================
+# TRADE PLAN
+# =========================================================
 
-    five = timeframes.get("5min", {})
-    fifteen = timeframes.get("15min", {})
-    support = five.get("support") or fifteen.get("support")
-    resistance = five.get("resistance") or fifteen.get("resistance")
+def build_trade_plan(
+    timeframes,
+    live_price,
+    ai
+):
+
+    if (
+        live_price is None
+        or ai["signal"] == "WAIT"
+    ):
+
+        return {
+            "signal": "WAIT",
+            "entry": None,
+            "stop_loss": None,
+            "target_1": None,
+            "target_2": None,
+            "target_3": None,
+            "risk_reward": None,
+            "invalidation": None,
+            "reason": ai.get(
+                "reasons",
+                []
+            )
+        }
+
+    five = timeframes.get(
+        "5min",
+        {}
+    )
+
+    fifteen = timeframes.get(
+        "15min",
+        {}
+    )
+
+    support = (
+        five.get("support")
+        or fifteen.get("support")
+    )
+
+    resistance = (
+        five.get("resistance")
+        or fifteen.get("resistance")
+    )
+
     entry = float(live_price)
 
     if ai["signal"] == "SELL":
-        stop = resistance if resistance and resistance > entry else entry * 1.005
-        risk = max(stop - entry, entry * 0.001)
-        t1, t2, t3 = entry-risk, entry-2*risk, entry-3*risk
+
+        stop = (
+            resistance
+            if resistance and resistance > entry
+            else entry * 1.005
+        )
+
+        risk = max(
+            stop - entry,
+            entry * 0.001
+        )
+
+        t1 = entry - risk
+        t2 = entry - 2 * risk
+        t3 = entry - 3 * risk
+
     else:
-        stop = support if support and support < entry else entry * 0.995
-        risk = max(entry-stop, entry * 0.001)
-        t1, t2, t3 = entry+risk, entry+2*risk, entry+3*risk
 
-    return {"signal":ai["signal"],"entry":round(entry,3),"stop_loss":round(stop,3),
-            "target_1":round(t1,3),"target_2":round(t2,3),"target_3":round(t3,3),
-            "risk_reward":"1:1 / 1:2 / 1:3","invalidation":round(stop,3),
-            "reason":ai.get("reasons",[])}
+        stop = (
+            support
+            if support and support < entry
+            else entry * 0.995
+        )
+
+        risk = max(
+            entry - stop,
+            entry * 0.001
+        )
+
+        t1 = entry + risk
+        t2 = entry + 2 * risk
+        t3 = entry + 3 * risk
+
+    return {
+        "signal": ai["signal"],
+
+        "entry": round(
+            entry,
+            3
+        ),
+
+        "stop_loss": round(
+            stop,
+            3
+        ),
+
+        "target_1": round(
+            t1,
+            3
+        ),
+
+        "target_2": round(
+            t2,
+            3
+        ),
+
+        "target_3": round(
+            t3,
+            3
+        ),
+
+        "risk_reward":
+            "1:1 / 1:2 / 1:3",
+
+        "invalidation": round(
+            stop,
+            3
+        ),
+
+        "reason": ai.get(
+            "reasons",
+            []
+        )
+    }
 
 
-def record_signal_history(ai, live_price):
-    """Record score/signal changes for later review."""
+# =========================================================
+# SIGNAL HISTORY
+# =========================================================
+
+def record_signal_history(
+    ai,
+    live_price
+):
+
     with lock:
-        history = state["gold"].setdefault("signal_history", [])
-        previous = history[-1] if history else None
-        if previous and previous.get("score") == ai["score"] and previous.get("signal") == ai["signal"]:
+
+        history = state["gold"].setdefault(
+            "signal_history",
+            []
+        )
+
+        previous = (
+            history[-1]
+            if history
+            else None
+        )
+
+        if (
+            previous
+            and previous.get("score")
+            == ai["score"]
+            and previous.get("signal")
+            == ai["signal"]
+        ):
             return
-        history.append({
-            "time": now_text(),
-            "price": round(float(live_price), 3) if live_price is not None else None,
-            "score": ai["score"], "signal": ai["signal"],
-            "confidence": ai["confidence"], "reasons": ai.get("reasons",[])[:8]
-        })
-        state["gold"]["signal_history"] = history[-50:]
+
+        history.append(
+            {
+                "time": now_text(),
+
+                "price": (
+                    round(
+                        float(live_price),
+                        3
+                    )
+                    if live_price is not None
+                    else None
+                ),
+
+                "score":
+                    ai["score"],
+
+                "signal":
+                    ai["signal"],
+
+                "confidence":
+                    ai["confidence"],
+
+                "reasons":
+                    ai.get(
+                        "reasons",
+                        []
+                    )[:8]
+            }
+        )
+
+        state["gold"][
+            "signal_history"
+        ] = history[-50:]
 
 
 # =========================================================
@@ -649,15 +922,16 @@ def gold_analysis_loop():
                 )
 
                 if result:
-                    result["candles"] = candles[-120:]
+
+                    result["candles"] = (
+                        candles[-120:]
+                    )
+
                     timeframe_data[
                         interval
                     ] = result
 
-                # Small delay to avoid unnecessary
-                # burst requests.
                 time.sleep(0.5)
-
 
             if timeframe_data:
 
@@ -667,23 +941,24 @@ def gold_analysis_loop():
                         "timeframes"
                     ] = timeframe_data
 
-
-                live_price = None
-
                 with lock:
+
                     live_price = (
                         state["gold"]["price"]
                     )
-
 
                 if live_price is None:
 
                     live_price = (
                         timeframe_data
-                        .get("5min", {})
-                        .get("price")
+                        .get(
+                            "5min",
+                            {}
+                        )
+                        .get(
+                            "price"
+                        )
                     )
-
 
                 if live_price is not None:
 
@@ -692,109 +967,162 @@ def gold_analysis_loop():
                         live_price
                     )
 
-
                     five = (
                         timeframe_data
-                        .get("5min", {})
+                        .get(
+                            "5min",
+                            {}
+                        )
                     )
 
+                    trade_plan = (
+                        build_trade_plan(
+                            timeframe_data,
+                            live_price,
+                            ai
+                        )
+                    )
+
+                    record_signal_history(
+                        ai,
+                        live_price
+                    )
 
                     with lock:
 
-                        trade_plan = build_trade_plan(timeframe_data, live_price, ai)
+                        state["gold"][
+                            "candles"
+                        ] = {
+                            k: v.get(
+                                "candles",
+                                []
+                            )
+                            for k, v
+                            in timeframe_data.items()
+                        }
 
+                        state["gold"][
+                            "trade_plan"
+                        ] = trade_plan
 
-                        record_signal_history(ai, live_price)
+                        state["gold"].update(
+                            {
 
+                                "trend":
+                                    five.get(
+                                        "trend",
+                                        "NEUTRAL"
+                                    ),
 
+                                "momentum":
+                                    five.get(
+                                        "momentum",
+                                        "NEUTRAL"
+                                    ),
 
-                        state["gold"]["candles"] = {k: v.get("candles", []) for k, v in timeframe_data.items()}
+                                "structure":
+                                    five.get(
+                                        "structure",
+                                        "RANGE"
+                                    ),
 
+                                "rsi":
+                                    five.get(
+                                        "rsi"
+                                    ),
 
-                        state["gold"]["trade_plan"] = trade_plan
+                                "ema20":
+                                    five.get(
+                                        "ema20"
+                                    ),
 
+                                "ema50":
+                                    five.get(
+                                        "ema50"
+                                    ),
 
+                                "support":
+                                    five.get(
+                                        "support"
+                                    ),
 
-                        state["gold"].update({
+                                "resistance":
+                                    five.get(
+                                        "resistance"
+                                    ),
 
-                            "trend":
-                                five.get(
-                                    "trend",
-                                    "NEUTRAL"
-                                ),
+                                "liquidity_high":
+                                    five.get(
+                                        "liquidity_high"
+                                    ),
 
-                            "momentum":
-                                five.get(
-                                    "momentum",
-                                    "NEUTRAL"
-                                ),
+                                "liquidity_low":
+                                    five.get(
+                                        "liquidity_low"
+                                    ),
 
-                            "structure":
-                                five.get(
-                                    "structure",
-                                    "RANGE"
-                                ),
+                                "sweep":
+                                    five.get(
+                                        "sweep",
+                                        "NONE"
+                                    ),
 
-                            "rsi":
-                                five.get("rsi"),
+                                "signal":
+                                    ai[
+                                        "signal"
+                                    ],
 
-                            "ema20":
-                                five.get("ema20"),
+                                "confidence":
+                                    ai[
+                                        "confidence"
+                                    ],
 
-                            "ema50":
-                                five.get("ema50"),
+                                "score":
+                                    ai[
+                                        "score"
+                                    ],
 
-                            "support":
-                                five.get("support"),
+                                "ai_reasons":
+                                    ai.get(
+                                        "reasons",
+                                        []
+                                    ),
 
-                            "resistance":
-                                five.get(
-                                    "resistance"
-                                ),
+                                "ai_warnings":
+                                    ai.get(
+                                        "warnings",
+                                        []
+                                    ),
 
-                            "liquidity_high":
-                                five.get(
-                                    "liquidity_high"
-                                ),
+                                "breakout":
+                                    ai.get(
+                                        "breakout",
+                                        "UNKNOWN"
+                                    ),
 
-                            "liquidity_low":
-                                five.get(
-                                    "liquidity_low"
-                                ),
+                                "liquidity_analysis":
+                                    ai.get(
+                                        "liquidity",
+                                        "UNKNOWN"
+                                    ),
 
-                            "sweep":
-                                five.get(
-                                    "sweep",
-                                    "NONE"
-                                ),
+                                "updated":
+                                    now_text(),
 
-                            "signal":
-                                ai["signal"],
-
-                            "confidence":
-                                ai["confidence"],
-
-                            "score":
-                                ai["score"],
-
-                            "updated":
-                                now_text(),
-
-                            "error":
-                                None
-                        })
-
+                                "error":
+                                    None
+                            }
+                        )
 
                     print(
                         "AI UPDATE:",
                         f"price={live_price}",
                         f"score={ai['score']}",
-                        f"decision={ai['signal']}"
+                        f"decision={ai['signal']}",
+                        f"confidence={ai['confidence']}%"
                     )
 
-
                     broadcast()
-
 
         except Exception as exc:
 
@@ -803,8 +1131,6 @@ def gold_analysis_loop():
                 repr(exc)
             )
 
-
-        # Analysis once per minute.
         time.sleep(60)
 
 
@@ -828,11 +1154,9 @@ def gold_websocket_loop():
                     "TWELVE_DATA_API_KEY is missing"
                 )
 
-
             print(
                 "Connecting Twelve Data Gold WebSocket..."
             )
-
 
             ws = websocket.create_connection(
                 WS_URL
@@ -841,7 +1165,6 @@ def gold_websocket_loop():
                 timeout=20
             )
 
-
             subscribe = {
                 "action": "subscribe",
                 "params": {
@@ -849,16 +1172,13 @@ def gold_websocket_loop():
                 }
             }
 
-
             ws.send(
                 json.dumps(subscribe)
             )
 
-
             print(
                 "TWELVE DATA GOLD SUBSCRIBE SENT"
             )
-
 
             with lock:
 
@@ -870,38 +1190,36 @@ def gold_websocket_loop():
                     "error"
                 ] = None
 
-
             broadcast()
-
 
             while True:
 
                 raw = ws.recv()
 
                 if not raw:
+
                     raise RuntimeError(
                         "WebSocket closed"
                     )
 
-
                 try:
+
                     message = json.loads(
                         raw
                     )
-                except Exception:
-                    continue
 
+                except Exception:
+
+                    continue
 
                 print(
                     "GOLD WS MESSAGE:",
                     message
                 )
 
-
                 event = message.get(
                     "event"
                 )
-
 
                 if event == "price":
 
@@ -915,7 +1233,6 @@ def gold_websocket_loop():
                         )
                     )
 
-
                     if (
                         symbol == GOLD_SYMBOL
                         and price is not None
@@ -925,7 +1242,6 @@ def gold_websocket_loop():
                             price
                         )
 
-
                 elif event == "subscribe-status":
 
                     print(
@@ -933,12 +1249,9 @@ def gold_websocket_loop():
                         message
                     )
 
-
                 elif event == "heartbeat":
 
-                    # Twelve Data heartbeat.
                     pass
-
 
                 elif event == "error":
 
@@ -947,14 +1260,12 @@ def gold_websocket_loop():
                         message
                     )
 
-
         except Exception as exc:
 
             print(
                 "GOLD WEBSOCKET ERROR:",
                 repr(exc)
             )
-
 
             with lock:
 
@@ -966,9 +1277,7 @@ def gold_websocket_loop():
                     "error"
                 ] = str(exc)
 
-
             broadcast()
-
 
         finally:
 
@@ -979,7 +1288,6 @@ def gold_websocket_loop():
 
             except Exception:
                 pass
-
 
         print(
             f"Gold WebSocket reconnecting "
@@ -992,7 +1300,7 @@ def gold_websocket_loop():
 
 
 # =========================================================
-# START WORKERS ONLY ONCE
+# START WORKERS
 # =========================================================
 
 def start_workers():
@@ -1006,11 +1314,9 @@ def start_workers():
 
         workers_started = True
 
-
     print(
         "Starting Trading-AI workers..."
     )
-
 
     ws_thread = threading.Thread(
         target=gold_websocket_loop,
@@ -1019,7 +1325,6 @@ def start_workers():
     )
 
     ws_thread.start()
-
 
     ai_thread = threading.Thread(
         target=gold_analysis_loop,
@@ -1076,17 +1381,17 @@ def stream():
     )
 
     with clients_lock:
+
         clients.append(
             client_queue
         )
-
 
     def generate():
 
         try:
 
-            # Immediately send current state.
             with lock:
+
                 initial = json.dumps(
                     state,
                     separators=(",", ":")
@@ -1096,7 +1401,6 @@ def stream():
                 "event: market\n"
                 f"data: {initial}\n\n"
             )
-
 
             while True:
 
@@ -1115,13 +1419,12 @@ def stream():
 
                 except queue.Empty:
 
-                    # Keep browser connection alive.
                     yield (
                         ": heartbeat\n\n"
                     )
 
-
         except GeneratorExit:
+
             pass
 
         finally:
@@ -1129,10 +1432,10 @@ def stream():
             with clients_lock:
 
                 if client_queue in clients:
+
                     clients.remove(
                         client_queue
                     )
-
 
     return Response(
         generate(),
@@ -1157,74 +1460,1037 @@ def stream():
 @app.route("/health")
 def health():
 
-    return jsonify({
-        "status": "ok",
-        "service": "Trading-AI",
-        "gold_connection":
-            state["gold"]["connection"],
-        "gold_price":
-            state["gold"]["price"],
-        "time":
-            now_text()
-    })
+    return jsonify(
+        {
+            "status": "ok",
+
+            "service":
+                "Trading-AI",
+
+            "gold_connection":
+                state["gold"][
+                    "connection"
+                ],
+
+            "gold_price":
+                state["gold"][
+                    "price"
+                ],
+
+            "time":
+                now_text()
+        }
+    )
 
 
 # =========================================================
-# OLD STYLE DASHBOARD
+# DASHBOARD
 # =========================================================
 
 HTML = r"""
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trading AI</title>
-<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-<style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:Arial;color:white;background:radial-gradient(circle at top,#183d75,#08172f 45%,#020817)}
-.page{width:94%;max-width:1280px;margin:auto;padding:22px 0 45px}.header{text-align:center;margin-bottom:20px}.header h1{margin:0;font-size:30px}.header p{margin:7px 0;color:#7fa9e8}
-.card{padding:20px;margin-bottom:18px;border-radius:18px;border:1px solid rgba(110,160,230,.2);background:linear-gradient(145deg,rgba(20,43,82,.96),rgba(5,19,42,.97));box-shadow:0 18px 45px rgba(0,0,0,.32)}
-.asset{font-size:20px;font-weight:700}.price{margin-top:8px;font-size:38px;font-weight:700}.live{margin-top:4px;color:#2be48e;font-size:13px;font-weight:700}.connection{margin-top:4px;color:#719bd4;font-size:11px}
-.metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:18px}.metric{padding:12px;min-height:68px;border-radius:11px;background:rgba(11,35,70,.72);border:1px solid rgba(100,150,220,.13)}.label{color:#78a5e5;font-size:10px;margin-bottom:6px}.value{font-size:15px;font-weight:700}
-.analysis{margin-top:14px;padding:17px;border-radius:13px;background:linear-gradient(100deg,#12529f,#0b3977)}.analysis-label{color:#82b0f5;font-size:10px;font-weight:700}.signal{margin-top:4px;font-size:27px;font-weight:800}.confidence,.score{margin-top:5px;font-size:14px;font-weight:700}
-.toolbar{display:flex;gap:7px;flex-wrap:wrap;margin:15px 0 10px}.tf{border:1px solid #38679e;background:#092447;color:#bcd8ff;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700}.tf.active{background:#1a64ad;color:white}
-.chart{height:430px;border-radius:12px;overflow:hidden;border:1px solid rgba(100,150,220,.16)}.grid2{display:grid;grid-template-columns:1.3fr .7fr;gap:14px;margin-top:14px}
-.panel{padding:16px;border-radius:13px;background:rgba(4,17,37,.55);border:1px solid rgba(100,150,220,.13)}.panel h3{margin:0 0 12px;font-size:14px;color:#9fc5f5}
-.tradegrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.tradebox{padding:11px;border-radius:9px;background:#081d39}.tradebox b{display:block;font-size:14px;margin-top:4px}.history{max-height:250px;overflow:auto}
-.row{display:grid;grid-template-columns:75px 80px 55px 70px 1fr;gap:7px;padding:8px 0;border-bottom:1px solid rgba(130,170,220,.1);font-size:11px}.reason{color:#8eafd8}.error{margin-top:12px;color:#ffb3b3;font-size:12px}.footer{text-align:center;color:#6489ba;font-size:11px;margin-top:15px}
-@media(max-width:900px){.metrics{grid-template-columns:repeat(3,1fr)}.grid2{grid-template-columns:1fr}.tradegrid{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.page{width:96%}.price{font-size:31px}.metrics{grid-template-columns:repeat(2,1fr)}.chart{height:330px}}
-</style></head>
-<body><div class="page"><div class="header"><h1>Trading AI</h1><p>Real-Time Market Intelligence • Explainable Multi-Timeframe Analysis</p></div><div id="gold"></div><div id="oil"></div><div class="footer">LIVE MARKET DATA • TRADING-AI</div></div>
-<script>
-let activeTF="5min",chart=null,resizeObserver=null,latestData=null;
-function fmt(v,d=3){if(v===null||v===undefined)return "—";let n=Number(v);return Number.isNaN(n)?"—":n.toFixed(d)}
-function tfLabel(x){return {"1min":"1m","5min":"5m","15min":"15m","30min":"30m","1h":"1H","4h":"4H","1day":"1D","1week":"1W","1month":"1M"}[x]||x}
-function metric(a,b){return `<div class="metric"><div class="label">${a}</div><div class="value">${b}</div></div>`}
-function box(a,b){return `<div class="tradebox"><span class="label">${a}</span><b>${b}</b></div>`}
-function draw(c){
- const el=document.getElementById("price-chart");if(!el)return;if(chart)chart.remove();
- chart=LightweightCharts.createChart(el,{layout:{background:{type:"solid",color:"#06162d"},textColor:"#9fc5f5"},grid:{vertLines:{color:"rgba(100,150,220,.08)"},horzLines:{color:"rgba(100,150,220,.08)"}},timeScale:{timeVisible:true,secondsVisible:false}});
- const s=chart.addCandlestickSeries({upColor:"#20c997",downColor:"#ff5c73",borderVisible:false,wickUpColor:"#20c997",wickDownColor:"#ff5c73"});
- const d=(c||[]).map(x=>({time:Math.floor(new Date(x.datetime||x.date).getTime()/1000),open:+x.open,high:+x.high,low:+x.low,close:+x.close})).filter(x=>Number.isFinite(x.time)&&[x.open,x.high,x.low,x.close].every(Number.isFinite));
- s.setData(d);chart.timeScale().fitContent();
- if(resizeObserver)resizeObserver.disconnect();resizeObserver=new ResizeObserver(()=>chart.applyOptions({width:el.clientWidth}));resizeObserver.observe(el);
-}
-function hist(h){if(!h||!h.length)return "<div class='reason'>No signal changes recorded yet.</div>";return h.slice().reverse().map(x=>`<div class="row"><span>${x.time}</span><span>${fmt(x.price)}</span><b>${x.score>0?"+":""}${x.score}</b><span>${x.signal}</span><span class="reason">${(x.reasons||[]).slice(0,3).join(" • ")}</span></div>`).join("")}
-function render(data){
- latestData=data;let g=data.gold,p=g.trade_plan||{};
- document.getElementById("gold").innerHTML=`<div class="card"><div class="asset">🥇 Gold — XAU/USD</div><div class="price">${fmt(g.price)}</div><div class="live">● LIVE</div><div class="connection">Connection: ${g.connection||"CONNECTING"} • Updated ${g.updated||"—"}</div>
- <div class="metrics">${metric("TREND",g.trend)}${metric("MOMENTUM",g.momentum)}${metric("STRUCTURE",g.structure)}${metric("RSI",fmt(g.rsi,2))}${metric("EMA 20",fmt(g.ema20))}${metric("EMA 50",fmt(g.ema50))}${metric("SUPPORT",fmt(g.support))}${metric("RESISTANCE",fmt(g.resistance))}${metric("LIQUIDITY HIGH",fmt(g.liquidity_high))}${metric("LIQUIDITY LOW",fmt(g.liquidity_low))}${metric("SWEEP",g.sweep||"NONE")}${metric("TIMEFRAME",tfLabel(activeTF))}</div>
- <div class="analysis"><div class="analysis-label">TRADING-AI CONCLUSION</div><div class="signal">${g.signal||"WAIT"}</div><div class="confidence">Confidence: ${g.confidence||0}%</div><div class="score">AI SCORE: ${g.score??0}</div></div>
- <div class="toolbar">${["1min","5min","15min","30min","1h","4h","1day","1week","1month"].map(x=>`<button class="tf ${activeTF===x?"active":""}" onclick="selectTF('${x}')">${tfLabel(x)}</button>`).join("")}</div><div id="price-chart" class="chart"></div>
- <div class="grid2"><div class="panel"><h3>🎯 AI TRADE SETUP</h3><div class="tradegrid">${box("ENTRY",fmt(p.entry))}${box("STOP LOSS",fmt(p.stop_loss))}${box("TARGET 1",fmt(p.target_1))}${box("TARGET 2",fmt(p.target_2))}${box("TARGET 3",fmt(p.target_3))}${box("R:R",p.risk_reward||"—")}${box("INVALIDATION",fmt(p.invalidation))}${box("SETUP",p.signal||"WAIT")}</div><div class="reason" style="margin-top:12px"><b>Why:</b> ${(p.reason||[]).join(" • ")||"Waiting for confirmation."}</div></div>
- <div class="panel"><h3>🕐 AI SIGNAL HISTORY</h3><div class="history">${hist(g.signal_history)}</div></div></div></div>`;
- document.getElementById("oil").innerHTML=`<div class="card"><div class="asset">🛢️ Crude Oil — WTI</div><div class="price">—</div><div class="live">● PLAN LIMIT</div><div class="connection">Connection: ${data.oil.connection||"UNAVAILABLE"}</div><div class="error">${data.oil.error||""}</div></div>`;
- draw((g.candles||{})[activeTF]||[]);
-}
-function selectTF(x){activeTF=x;if(latestData)render(latestData)}
-fetch("/api/market",{cache:"no-store"}).then(r=>r.json()).then(render).catch(console.error);
-const source=new EventSource("/stream");source.addEventListener("market",e=>{try{render(JSON.parse(e.data))}catch(err){console.error(err)}});
-</script></body></html>
-"""
 
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+name="viewport"
+content="width=device-width, initial-scale=1.0"
+>
+
+<title>Trading AI</title>
+
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+
+<style>
+
+*{
+box-sizing:border-box
+}
+
+body{
+margin:0;
+min-height:100vh;
+font-family:Arial;
+color:white;
+background:
+radial-gradient(
+circle at top,
+#183d75,
+#08172f 45%,
+#020817
+)
+}
+
+.page{
+width:94%;
+max-width:1280px;
+margin:auto;
+padding:22px 0 45px
+}
+
+.header{
+text-align:center;
+margin-bottom:20px
+}
+
+.header h1{
+margin:0;
+font-size:30px
+}
+
+.header p{
+margin:7px 0;
+color:#7fa9e8
+}
+
+.card{
+padding:20px;
+margin-bottom:18px;
+border-radius:18px;
+border:1px solid rgba(110,160,230,.2);
+background:
+linear-gradient(
+145deg,
+rgba(20,43,82,.96),
+rgba(5,19,42,.97)
+);
+box-shadow:
+0 18px 45px rgba(0,0,0,.32)
+}
+
+.asset{
+font-size:20px;
+font-weight:700
+}
+
+.price{
+margin-top:8px;
+font-size:38px;
+font-weight:700
+}
+
+.live{
+margin-top:4px;
+color:#2be48e;
+font-size:13px;
+font-weight:700
+}
+
+.connection{
+margin-top:4px;
+color:#719bd4;
+font-size:11px
+}
+
+.metrics{
+display:grid;
+grid-template-columns:repeat(6,1fr);
+gap:8px;
+margin-top:18px
+}
+
+.metric{
+padding:12px;
+min-height:68px;
+border-radius:11px;
+background:rgba(11,35,70,.72);
+border:1px solid rgba(100,150,220,.13)
+}
+
+.label{
+color:#78a5e5;
+font-size:10px;
+margin-bottom:6px
+}
+
+.value{
+font-size:15px;
+font-weight:700
+}
+
+.analysis{
+margin-top:14px;
+padding:17px;
+border-radius:13px;
+background:
+linear-gradient(
+100deg,
+#12529f,
+#0b3977
+)
+}
+
+.analysis-label{
+color:#82b0f5;
+font-size:10px;
+font-weight:700
+}
+
+.signal{
+margin-top:4px;
+font-size:27px;
+font-weight:800
+}
+
+.confidence,
+.score{
+margin-top:5px;
+font-size:14px;
+font-weight:700
+}
+
+.toolbar{
+display:flex;
+gap:7px;
+flex-wrap:wrap;
+margin:15px 0 10px
+}
+
+.tf{
+border:1px solid #38679e;
+background:#092447;
+color:#bcd8ff;
+padding:8px 12px;
+border-radius:8px;
+cursor:pointer;
+font-weight:700
+}
+
+.tf.active{
+background:#1a64ad;
+color:white
+}
+
+.chart{
+height:430px;
+border-radius:12px;
+overflow:hidden;
+border:1px solid rgba(100,150,220,.16)
+}
+
+.grid2{
+display:grid;
+grid-template-columns:1.3fr .7fr;
+gap:14px;
+margin-top:14px
+}
+
+.panel{
+padding:16px;
+border-radius:13px;
+background:rgba(4,17,37,.55);
+border:1px solid rgba(100,150,220,.13)
+}
+
+.panel h3{
+margin:0 0 12px;
+font-size:14px;
+color:#9fc5f5
+}
+
+.tradegrid{
+display:grid;
+grid-template-columns:repeat(4,1fr);
+gap:8px
+}
+
+.tradebox{
+padding:11px;
+border-radius:9px;
+background:#081d39
+}
+
+.tradebox b{
+display:block;
+font-size:14px;
+margin-top:4px
+}
+
+.history{
+max-height:250px;
+overflow:auto
+}
+
+.row{
+display:grid;
+grid-template-columns:
+75px 80px 55px 70px 1fr;
+gap:7px;
+padding:8px 0;
+border-bottom:
+1px solid rgba(130,170,220,.1);
+font-size:11px
+}
+
+.reason{
+color:#8eafd8
+}
+
+.warning{
+margin-top:8px;
+padding:9px;
+border-radius:8px;
+background:rgba(150,90,20,.2);
+color:#ffd48a;
+font-size:11px
+}
+
+.error{
+margin-top:12px;
+color:#ffb3b3;
+font-size:12px
+}
+
+.footer{
+text-align:center;
+color:#6489ba;
+font-size:11px;
+margin-top:15px
+}
+
+@media(max-width:900px){
+
+.metrics{
+grid-template-columns:repeat(3,1fr)
+}
+
+.grid2{
+grid-template-columns:1fr
+}
+
+.tradegrid{
+grid-template-columns:repeat(2,1fr)
+}
+
+}
+
+@media(max-width:480px){
+
+.page{
+width:96%
+}
+
+.price{
+font-size:31px
+}
+
+.metrics{
+grid-template-columns:repeat(2,1fr)
+}
+
+.chart{
+height:330px
+}
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="page">
+
+<div class="header">
+
+<h1>Trading AI</h1>
+
+<p>
+Real-Time Market Intelligence •
+Multi-Factor Market Analysis
+</p>
+
+</div>
+
+<div id="gold"></div>
+
+<div id="oil"></div>
+
+<div class="footer">
+LIVE MARKET DATA • TRADING-AI
+</div>
+
+</div>
+
+<script>
+
+let activeTF="5min";
+let chart=null;
+let resizeObserver=null;
+let latestData=null;
+
+
+function fmt(v,d=3){
+
+if(
+v===null ||
+v===undefined
+)
+return "—";
+
+let n=Number(v);
+
+return Number.isNaN(n)
+? "—"
+: n.toFixed(d);
+
+}
+
+
+function tfLabel(x){
+
+return {
+
+"1min":"1m",
+"5min":"5m",
+"15min":"15m",
+"30min":"30m",
+"1h":"1H",
+"4h":"4H",
+"1day":"1D",
+"1week":"1W",
+"1month":"1M"
+
+}[x]||x;
+
+}
+
+
+function metric(a,b){
+
+return `
+<div class="metric">
+
+<div class="label">
+${a}
+</div>
+
+<div class="value">
+${b}
+</div>
+
+</div>
+`;
+
+}
+
+
+function box(a,b){
+
+return `
+<div class="tradebox">
+
+<span class="label">
+${a}
+</span>
+
+<b>
+${b}
+</b>
+
+</div>
+`;
+
+}
+
+
+function draw(c){
+
+const el=
+document.getElementById(
+"price-chart"
+);
+
+if(!el)
+return;
+
+if(chart)
+chart.remove();
+
+chart=
+LightweightCharts.createChart(
+el,
+{
+layout:{
+background:{
+type:"solid",
+color:"#06162d"
+},
+textColor:"#9fc5f5"
+},
+
+grid:{
+vertLines:{
+color:
+"rgba(100,150,220,.08)"
+},
+
+horzLines:{
+color:
+"rgba(100,150,220,.08)"
+}
+},
+
+timeScale:{
+timeVisible:true,
+secondsVisible:false
+}
+}
+);
+
+const s=
+chart.addCandlestickSeries(
+{
+upColor:"#20c997",
+downColor:"#ff5c73",
+borderVisible:false,
+wickUpColor:"#20c997",
+wickDownColor:"#ff5c73"
+}
+);
+
+const d=
+(c||[])
+.map(
+x=>({
+
+time:
+Math.floor(
+new Date(
+x.datetime||x.date
+).getTime()/1000
+),
+
+open:+x.open,
+high:+x.high,
+low:+x.low,
+close:+x.close
+
+})
+)
+.filter(
+x=>
+Number.isFinite(x.time)
+&&
+[
+x.open,
+x.high,
+x.low,
+x.close
+].every(
+Number.isFinite
+)
+);
+
+s.setData(d);
+
+chart.timeScale().fitContent();
+
+if(resizeObserver)
+resizeObserver.disconnect();
+
+resizeObserver=
+new ResizeObserver(
+()=>
+chart.applyOptions(
+{
+width:
+el.clientWidth
+}
+)
+);
+
+resizeObserver.observe(el);
+
+}
+
+
+function hist(h){
+
+if(!h||!h.length)
+
+return `
+<div class="reason">
+No signal changes recorded yet.
+</div>
+`;
+
+return h
+.slice()
+.reverse()
+.map(
+x=>`
+
+<div class="row">
+
+<span>
+${x.time}
+</span>
+
+<span>
+${fmt(x.price)}
+</span>
+
+<b>
+${x.score>0?"+":""}${x.score}
+</b>
+
+<span>
+${x.signal}
+</span>
+
+<span class="reason">
+${(x.reasons||[])
+.slice(0,3)
+.join(" • ")}
+</span>
+
+</div>
+
+`
+)
+.join("");
+
+}
+
+
+function warningsHtml(warnings){
+
+if(
+!warnings ||
+!warnings.length
+)
+return "";
+
+return warnings
+.map(
+w=>
+`
+<div class="warning">
+⚠ ${w}
+</div>
+`
+)
+.join("");
+
+}
+
+
+function render(data){
+
+latestData=data;
+
+let g=data.gold;
+
+let p=
+g.trade_plan||{};
+
+
+document.getElementById(
+"gold"
+).innerHTML=
+
+`
+
+<div class="card">
+
+<div class="asset">
+🥇 Gold — XAU/USD
+</div>
+
+<div class="price">
+${fmt(g.price)}
+</div>
+
+<div class="live">
+● LIVE
+</div>
+
+<div class="connection">
+Connection:
+${g.connection||"CONNECTING"}
+•
+Updated
+${g.updated||"—"}
+</div>
+
+
+<div class="metrics">
+
+${metric(
+"TREND",
+g.trend
+)}
+
+${metric(
+"MOMENTUM",
+g.momentum
+)}
+
+${metric(
+"STRUCTURE",
+g.structure
+)}
+
+${metric(
+"RSI",
+fmt(g.rsi,2)
+)}
+
+${metric(
+"EMA 20",
+fmt(g.ema20)
+)}
+
+${metric(
+"EMA 50",
+fmt(g.ema50)
+)}
+
+${metric(
+"SUPPORT",
+fmt(g.support)
+)}
+
+${metric(
+"RESISTANCE",
+fmt(g.resistance)
+)}
+
+${metric(
+"LIQUIDITY HIGH",
+fmt(g.liquidity_high)
+)}
+
+${metric(
+"LIQUIDITY LOW",
+fmt(g.liquidity_low)
+)}
+
+${metric(
+"SWEEP",
+g.sweep||"NONE"
+)}
+
+${metric(
+"TIMEFRAME",
+tfLabel(activeTF)
+)}
+
+</div>
+
+
+<div class="analysis">
+
+<div class="analysis-label">
+TRADING-AI CONCLUSION
+</div>
+
+<div class="signal">
+${g.signal||"WAIT"}
+</div>
+
+<div class="confidence">
+Confidence:
+${g.confidence||0}%
+</div>
+
+<div class="score">
+AI SCORE:
+${g.score??0}
+</div>
+
+<div class="reason"
+style="margin-top:10px">
+
+<b>
+Engine:
+</b>
+
+${g.breakout||"UNKNOWN"}
+
+•
+
+${g.liquidity_analysis||"UNKNOWN"}
+
+</div>
+
+${warningsHtml(
+g.ai_warnings
+)}
+
+</div>
+
+
+<div class="toolbar">
+
+${
+[
+"1min",
+"5min",
+"15min",
+"30min",
+"1h",
+"4h",
+"1day",
+"1week",
+"1month"
+]
+.map(
+x=>
+`
+<button
+class="tf ${activeTF===x?"active":""}"
+onclick="selectTF('${x}')"
+>
+${tfLabel(x)}
+</button>
+`
+)
+.join("")
+}
+
+</div>
+
+
+<div
+id="price-chart"
+class="chart"
+></div>
+
+
+<div class="grid2">
+
+
+<div class="panel">
+
+<h3>
+🎯 AI TRADE SETUP
+</h3>
+
+<div class="tradegrid">
+
+${box(
+"ENTRY",
+fmt(p.entry)
+)}
+
+${box(
+"STOP LOSS",
+fmt(p.stop_loss)
+)}
+
+${box(
+"TARGET 1",
+fmt(p.target_1)
+)}
+
+${box(
+"TARGET 2",
+fmt(p.target_2)
+)}
+
+${box(
+"TARGET 3",
+fmt(p.target_3)
+)}
+
+${box(
+"R:R",
+p.risk_reward||"—"
+)}
+
+${box(
+"INVALIDATION",
+fmt(p.invalidation)
+)}
+
+${box(
+"SETUP",
+p.signal||"WAIT"
+)}
+
+</div>
+
+
+<div
+class="reason"
+style="margin-top:12px"
+>
+
+<b>
+Why:
+</b>
+
+${
+(p.reason||[])
+.join(" • ")
+||
+"Waiting for confirmation."
+}
+
+</div>
+
+
+<div
+class="reason"
+style="margin-top:12px"
+>
+
+<b>
+Multi-Factor Evidence:
+</b>
+
+${
+(g.ai_reasons||[])
+.join(" • ")
+||
+"Waiting for enough evidence."
+}
+
+</div>
+
+
+${warningsHtml(
+g.ai_warnings
+)}
+
+</div>
+
+
+<div class="panel">
+
+<h3>
+🕐 AI SIGNAL HISTORY
+</h3>
+
+<div class="history">
+
+${hist(
+g.signal_history
+)}
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+`;
+
+
+document.getElementById(
+"oil"
+).innerHTML=
+
+`
+
+<div class="card">
+
+<div class="asset">
+🛢️ Crude Oil — WTI
+</div>
+
+<div class="price">
+—
+</div>
+
+<div class="live">
+● PLAN LIMIT
+</div>
+
+<div class="connection">
+Connection:
+${data.oil.connection||"UNAVAILABLE"}
+</div>
+
+<div class="error">
+${data.oil.error||""}
+</div>
+
+</div>
+
+`;
+
+
+draw(
+(g.candles||{})[
+activeTF
+]||[]
+);
+
+}
+
+
+function selectTF(x){
+
+activeTF=x;
+
+if(latestData)
+render(latestData);
+
+}
+
+
+fetch(
+"/api/market",
+{
+cache:"no-store"
+}
+)
+.then(
+r=>r.json()
+)
+.then(
+render
+)
+.catch(
+console.error
+);
+
+
+const source=
+new EventSource(
+"/stream"
+);
+
+
+source.addEventListener(
+"market",
+e=>{
+
+try{
+
+render(
+JSON.parse(
+e.data
+)
+);
+
+}
+
+catch(err){
+
+console.error(err);
+
+}
+
+}
+);
+
+</script>
+
+</body>
+
+</html>
+"""
 
 
 # =========================================================
