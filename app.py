@@ -25,27 +25,101 @@ OIL_SYMBOL = "WTI/USD"
 
 WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
 
-CANDLE_INTERVALS = [
-    "1min",
-    "5min",
-    "15min",
-    "30min",
-    "1h",
-    "4h",
-    "1day",
-    "1week",
-    "1month"
-]
+# =========================================================
+# TIMEFRAME REFRESH POLICY
+# =========================================================
+#
+# IMPORTANT:
+# We do NOT request every timeframe every minute.
+#
+# This reduces Twelve Data HTTP rate-limit pressure (429).
+# Existing candle data is reused between refreshes.
+#
+# The first request for each timeframe is staggered so that
+# the application does not create a burst of 9 HTTP requests.
+#
+
+TIMEFRAME_CONFIG = {
+    "1min": {
+        "refresh": 60,
+        "initial_delay": 5,
+    },
+
+    "5min": {
+        "refresh": 120,
+        "initial_delay": 12,
+    },
+
+    "15min": {
+        "refresh": 300,
+        "initial_delay": 19,
+    },
+
+    "30min": {
+        "refresh": 600,
+        "initial_delay": 26,
+    },
+
+    "1h": {
+        "refresh": 900,
+        "initial_delay": 33,
+    },
+
+    "4h": {
+        "refresh": 1800,
+        "initial_delay": 40,
+    },
+
+    "1day": {
+        "refresh": 3600,
+        "initial_delay": 47,
+    },
+
+    "1week": {
+        "refresh": 7200,
+        "initial_delay": 54,
+    },
+
+    "1month": {
+        "refresh": 14400,
+        "initial_delay": 61,
+    },
+}
+
+CANDLE_INTERVALS = list(TIMEFRAME_CONFIG.keys())
+
+CANDLE_OUTPUTSIZE = 100
+
+# Minimum time between HTTP requests even if something
+# triggers the analysis loop repeatedly.
+MIN_HTTP_GAP = 4.0
 
 # =========================================================
 # GLOBAL STATE
 # =========================================================
 
 lock = threading.RLock()
+
 workers_started = False
 
 clients = []
 clients_lock = threading.Lock()
+
+# Candle cache metadata.
+candle_cache = {}
+
+for _interval, _config in TIMEFRAME_CONFIG.items():
+    candle_cache[_interval] = {
+        "candles": [],
+        "last_fetch": 0.0,
+        "next_fetch": time.time() + _config["initial_delay"],
+        "backoff_until": 0.0,
+        "failures": 0,
+        "last_status": None,
+    }
+
+last_http_request = 0.0
+
 
 state = {
     "gold": {
@@ -107,8 +181,12 @@ state = {
 
         "ai_reasons": [],
         "ai_warnings": [],
+
         "breakout": "UNKNOWN",
         "liquidity_analysis": "UNKNOWN",
+
+        "data_status": "STARTING",
+        "data_message": "Waiting for market candle data.",
 
         "error": None
     },
@@ -167,7 +245,15 @@ def number(value):
         return None
 
 
+def safe_round(value, digits=3):
+    try:
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
 def broadcast():
+
     with lock:
         payload = json.dumps(
             state,
@@ -177,32 +263,43 @@ def broadcast():
     dead = []
 
     with clients_lock:
+
         for q in clients:
+
             try:
                 q.put_nowait(payload)
+
             except Exception:
                 dead.append(q)
 
         for q in dead:
+
             if q in clients:
                 clients.remove(q)
 
 
 def update_gold_price(price):
+
     price = number(price)
 
     if price is None:
         return
 
     with lock:
+
         state["gold"]["price"] = price
+
         state["gold"]["updated"] = now_text()
+
         state["gold"]["connection"] = "CONNECTED"
+
         state["gold"]["error"] = None
 
     broadcast()
 
-    print(f"STATE UPDATED: GOLD = {price}")
+    print(
+        f"STATE UPDATED: GOLD = {price}"
+    )
 
 
 # =========================================================
@@ -210,22 +307,28 @@ def update_gold_price(price):
 # =========================================================
 
 def ema(values, period):
+
     if not values or len(values) < period:
         return None
 
     multiplier = 2.0 / (period + 1.0)
 
-    result = sum(values[:period]) / period
+    result = sum(
+        values[:period]
+    ) / period
 
     for value in values[period:]:
+
         result = (
-            (value - result) * multiplier
+            (value - result)
+            * multiplier
         ) + result
 
     return result
 
 
 def rsi(values, period=14):
+
     if len(values) < period + 1:
         return None
 
@@ -233,86 +336,184 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         if change >= 0:
+
             gains.append(change)
             losses.append(0)
+
         else:
+
             gains.append(0)
             losses.append(abs(change))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    for i in range(period, len(gains)):
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
+
         avg_gain = (
-            ((avg_gain * (period - 1)) + gains[i])
-            / period
-        )
+            (
+                avg_gain
+                * (period - 1)
+            )
+            + gains[i]
+        ) / period
 
         avg_loss = (
-            ((avg_loss * (period - 1)) + losses[i])
-            / period
-        )
+            (
+                avg_loss
+                * (period - 1)
+            )
+            + losses[i]
+        ) / period
 
     if avg_loss == 0:
         return 100.0
 
     rs = avg_gain / avg_loss
 
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100.0 - (
+        100.0 / (1.0 + rs)
+    )
 
 
 # =========================================================
-# TWELVE DATA CANDLES
+# TWELVE DATA CANDLE REQUEST
 # =========================================================
 
-def get_candles(symbol, interval, outputsize=100):
+def get_candles(
+    symbol,
+    interval,
+    outputsize=100
+):
+
+    global last_http_request
 
     if not API_KEY:
-        print("ERROR: TWELVE_DATA_API_KEY missing")
+
+        print(
+            "ERROR: TWELVE_DATA_API_KEY missing"
+        )
+
         return []
+
+
+    # -----------------------------------------------------
+    # Global request spacing
+    # -----------------------------------------------------
+
+    now = time.time()
+
+    elapsed = (
+        now - last_http_request
+    )
+
+    if elapsed < MIN_HTTP_GAP:
+
+        time.sleep(
+            MIN_HTTP_GAP - elapsed
+        )
+
+    last_http_request = time.time()
+
 
     try:
 
         response = requests.get(
+
             "https://api.twelvedata.com/time_series",
+
             params={
                 "symbol": symbol,
                 "interval": interval,
                 "outputsize": outputsize,
                 "apikey": API_KEY
             },
+
             timeout=15
         )
 
-        if response.status_code != 200:
+
+        status = response.status_code
+
+
+        # -------------------------------------------------
+        # RATE LIMIT
+        # -------------------------------------------------
+
+        if status == 429:
+
+            print(
+                "CANDLE RATE LIMIT 429:",
+                interval
+            )
+
+            return []
+
+
+        if status != 200:
+
             print(
                 "CANDLE HTTP ERROR:",
                 interval,
-                response.status_code
+                status
             )
+
             return []
+
 
         data = response.json()
 
+
+        # -------------------------------------------------
+        # Twelve Data API error
+        # -------------------------------------------------
+
         if data.get("status") == "error":
+
             print(
                 "CANDLE API ERROR:",
                 interval,
                 data.get("message")
             )
+
             return []
 
-        values = data.get("values", [])
+
+        values = data.get(
+            "values",
+            []
+        )
+
 
         if not values:
+
             return []
 
-        values = list(reversed(values))
+
+        values = list(
+            reversed(values)
+        )
+
 
         return values
+
 
     except Exception as exc:
 
@@ -326,6 +527,115 @@ def get_candles(symbol, interval, outputsize=100):
 
 
 # =========================================================
+# CACHE / RATE LIMIT MANAGER
+# =========================================================
+
+def refresh_one_timeframe(interval):
+
+    config = TIMEFRAME_CONFIG[
+        interval
+    ]
+
+    cache = candle_cache[
+        interval
+    ]
+
+    now = time.time()
+
+
+    # Not due yet.
+    if now < cache["next_fetch"]:
+        return False
+
+
+    # Backoff after previous 429/error.
+    if now < cache["backoff_until"]:
+        return False
+
+
+    print(
+        "CANDLE FETCH:",
+        interval
+    )
+
+
+    candles = get_candles(
+        GOLD_SYMBOL,
+        interval,
+        CANDLE_OUTPUTSIZE
+    )
+
+
+    # -----------------------------------------------------
+    # Successful request
+    # -----------------------------------------------------
+
+    if candles:
+
+        cache["candles"] = candles
+
+        cache["last_fetch"] = now
+
+        cache["failures"] = 0
+
+        cache["last_status"] = 200
+
+        cache["backoff_until"] = 0
+
+        cache["next_fetch"] = (
+            now
+            + config["refresh"]
+        )
+
+        print(
+            "CANDLE UPDATED:",
+            interval,
+            "count=",
+            len(candles)
+        )
+
+        return True
+
+
+    # -----------------------------------------------------
+    # Failed request
+    # -----------------------------------------------------
+
+    cache["failures"] += 1
+
+    cache["last_status"] = 429
+
+    failure_count = min(
+        cache["failures"],
+        5
+    )
+
+    # Progressive backoff:
+    # 30s -> 60s -> 120s -> 240s -> 300s
+    backoff = min(
+        30 * (2 ** (failure_count - 1)),
+        300
+    )
+
+    cache["backoff_until"] = (
+        now + backoff
+    )
+
+    # Keep existing data alive.
+    cache["next_fetch"] = (
+        now + backoff
+    )
+
+    print(
+        "CANDLE RETRY DELAY:",
+        interval,
+        f"{backoff}s"
+    )
+
+    return False
+
+
+# =========================================================
 # ANALYZE ONE TIMEFRAME
 # =========================================================
 
@@ -334,15 +644,24 @@ def analyze_timeframe(candles):
     if not candles:
         return {}
 
+
     closes = []
     highs = []
     lows = []
 
     for candle in candles:
 
-        close = number(candle.get("close"))
-        high = number(candle.get("high"))
-        low = number(candle.get("low"))
+        close = number(
+            candle.get("close")
+        )
+
+        high = number(
+            candle.get("high")
+        )
+
+        low = number(
+            candle.get("low")
+        )
 
         if close is not None:
             closes.append(close)
@@ -353,18 +672,33 @@ def analyze_timeframe(candles):
         if low is not None:
             lows.append(low)
 
+
     if len(closes) < 20:
         return {}
 
+
     current = closes[-1]
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
+    ema20_value = ema(
+        closes,
+        20
+    )
 
-    current_rsi = rsi(closes, 14)
+    ema50_value = ema(
+        closes,
+        50
+    )
+
+    current_rsi = rsi(
+        closes,
+        14
+    )
+
 
     recent_highs = highs[-20:]
+
     recent_lows = lows[-20:]
+
 
     support = (
         min(recent_lows)
@@ -378,50 +712,96 @@ def analyze_timeframe(candles):
         else None
     )
 
-    if ema20 is not None and ema50 is not None:
 
-        if current > ema20 > ema50:
+    # -----------------------------------------------------
+    # Trend
+    # -----------------------------------------------------
+
+    if (
+        ema20_value is not None
+        and ema50_value is not None
+    ):
+
+        if (
+            current
+            > ema20_value
+            > ema50_value
+        ):
+
             trend = "BULLISH"
 
-        elif current < ema20 < ema50:
+        elif (
+            current
+            < ema20_value
+            < ema50_value
+        ):
+
             trend = "BEARISH"
 
         else:
+
             trend = "NEUTRAL"
 
     else:
+
         trend = "NEUTRAL"
 
+
+    # -----------------------------------------------------
+    # Momentum
+    # -----------------------------------------------------
+
     if current_rsi is None:
+
         momentum = "NEUTRAL"
 
     elif current_rsi >= 55:
+
         momentum = "BUYING"
 
     elif current_rsi <= 45:
+
         momentum = "SELLING"
 
     else:
+
         momentum = "NEUTRAL"
+
+
+    # -----------------------------------------------------
+    # Structure
+    # -----------------------------------------------------
 
     recent = closes[-10:]
 
     if len(recent) >= 10:
 
-        old_average = sum(recent[:5]) / 5
-        new_average = sum(recent[-5:]) / 5
+        old_average = (
+            sum(recent[:5])
+            / 5
+        )
+
+        new_average = (
+            sum(recent[-5:])
+            / 5
+        )
 
         if new_average > old_average:
+
             structure = "HIGHER"
 
         elif new_average < old_average:
+
             structure = "LOWER"
 
         else:
+
             structure = "RANGE"
 
     else:
+
         structure = "RANGE"
+
 
     # -----------------------------------------------------
     # Liquidity
@@ -439,74 +819,112 @@ def analyze_timeframe(candles):
         else support
     )
 
+
     sweep = "NONE"
+
 
     if len(candles) >= 3:
 
-        previous_high = max(highs[-3:-1])
-        previous_low = min(lows[-3:-1])
+        previous_high = max(
+            highs[-3:-1]
+        )
+
+        previous_low = min(
+            lows[-3:-1]
+        )
 
         latest_high = highs[-1]
+
         latest_low = lows[-1]
+
         latest_close = closes[-1]
+
 
         if (
             latest_high > previous_high
             and latest_close < previous_high
         ):
+
             sweep = "HIGH SWEEP"
+
 
         elif (
             latest_low < previous_low
             and latest_close > previous_low
         ):
+
             sweep = "LOW SWEEP"
 
+
     return {
+
         "price": current,
 
         "trend": trend,
+
         "momentum": momentum,
+
         "structure": structure,
 
         "rsi": (
-            round(current_rsi, 2)
+            round(
+                current_rsi,
+                2
+            )
             if current_rsi is not None
             else None
         ),
 
         "ema20": (
-            round(ema20, 3)
-            if ema20 is not None
+            round(
+                ema20_value,
+                3
+            )
+            if ema20_value is not None
             else None
         ),
 
         "ema50": (
-            round(ema50, 3)
-            if ema50 is not None
+            round(
+                ema50_value,
+                3
+            )
+            if ema50_value is not None
             else None
         ),
 
         "support": (
-            round(support, 3)
+            round(
+                support,
+                3
+            )
             if support is not None
             else None
         ),
 
         "resistance": (
-            round(resistance, 3)
+            round(
+                resistance,
+                3
+            )
             if resistance is not None
             else None
         ),
 
         "liquidity_high": (
-            round(liquidity_high, 3)
+            round(
+                liquidity_high,
+                3
+            )
             if liquidity_high is not None
             else None
         ),
 
         "liquidity_low": (
-            round(liquidity_low, 3)
+            round(
+                liquidity_low,
+                3
+            )
             if liquidity_low is not None
             else None
         ),
@@ -516,10 +934,12 @@ def analyze_timeframe(candles):
 
 
 # =========================================================
-# CONVERT DATA FOR NEW SIGNAL ENGINE
+# CONVERT DATA FOR SIGNAL ENGINE
 # =========================================================
 
-def convert_to_engine_candles(candles):
+def convert_to_engine_candles(
+    candles
+):
 
     result = []
 
@@ -528,55 +948,62 @@ def convert_to_engine_candles(candles):
         try:
 
             result.append(
+
                 Candle(
+
                     open=float(
-                        candle.get("open", 0)
+                        candle.get(
+                            "open",
+                            0
+                        )
                     ),
 
                     high=float(
-                        candle.get("high", 0)
+                        candle.get(
+                            "high",
+                            0
+                        )
                     ),
 
                     low=float(
-                        candle.get("low", 0)
+                        candle.get(
+                            "low",
+                            0
+                        )
                     ),
 
                     close=float(
-                        candle.get("close", 0)
+                        candle.get(
+                            "close",
+                            0
+                        )
                     ),
 
                     volume=float(
-                        candle.get("volume", 0) or 0
+                        candle.get(
+                            "volume",
+                            0
+                        )
+                        or 0
                     )
                 )
             )
 
         except Exception:
+
             continue
 
     return result
 
 
 # =========================================================
-# NEW MULTI-FACTOR AI ENGINE
+# MULTI-FACTOR AI ENGINE
 # =========================================================
 
-def build_ai_analysis(timeframes, live_price):
-
-    """
-    Multi-factor Trading-AI engine.
-
-    Uses:
-        Trend
-        Market structure
-        Momentum
-        RSI
-        EMA
-        Liquidity
-        Breakout
-        Higher timeframe confirmation
-        Conflict detection
-    """
+def build_ai_analysis(
+    timeframes,
+    live_price
+):
 
     five_raw = (
         timeframes
@@ -596,6 +1023,7 @@ def build_ai_analysis(timeframes, live_price):
         .get("candles", [])
     )
 
+
     five = convert_to_engine_candles(
         five_raw
     )
@@ -608,11 +1036,19 @@ def build_ai_analysis(timeframes, live_price):
         one_hour_raw
     )
 
+
+    # -----------------------------------------------------
+    # Data quality gate
+    # -----------------------------------------------------
+
     if len(five) < 60:
 
         return {
+
             "signal": "WAIT",
+
             "confidence": 25,
+
             "score": 0,
 
             "reasons": [
@@ -620,17 +1056,28 @@ def build_ai_analysis(timeframes, live_price):
             ],
 
             "warnings": [
-                "Multi-factor engine needs more candles."
+                "Multi-factor engine needs at least "
+                "60 candles."
             ],
 
             "trend": "UNKNOWN",
+
             "momentum": "UNKNOWN",
+
             "structure": "UNKNOWN",
+
             "liquidity": "UNKNOWN",
+
             "breakout": "UNKNOWN"
         }
 
+
+    # -----------------------------------------------------
+    # 5m primary engine
+    # -----------------------------------------------------
+
     result = generate_signal(
+
         candles=five,
 
         higher_timeframe_candles=(
@@ -640,10 +1087,14 @@ def build_ai_analysis(timeframes, live_price):
         )
     )
 
-    data = signal_to_dict(result)
+
+    data = signal_to_dict(
+        result
+    )
+
 
     # -----------------------------------------------------
-    # 1H CONFIRMATION
+    # 1H confirmation
     # -----------------------------------------------------
 
     if len(one_hour) >= 60:
@@ -652,7 +1103,10 @@ def build_ai_analysis(timeframes, live_price):
             candles=one_hour
         )
 
-        higher_trend = one_hour_result.trend
+        higher_trend = (
+            one_hour_result.trend
+        )
+
 
         if (
             data["decision"] == "BUY"
@@ -670,6 +1124,7 @@ def build_ai_analysis(timeframes, live_price):
                 "1H trend conflicts with BUY setup."
             )
 
+
         elif (
             data["decision"] == "SELL"
             and higher_trend == "BULLISH"
@@ -686,19 +1141,38 @@ def build_ai_analysis(timeframes, live_price):
                 "1H trend conflicts with SELL setup."
             )
 
+
     return {
-        "signal": data["decision"],
-        "confidence": data["confidence"],
-        "score": data["score"],
 
-        "reasons": data["reasons"],
-        "warnings": data["warnings"],
+        "signal":
+            data["decision"],
 
-        "trend": data["trend"],
-        "momentum": data["momentum"],
-        "structure": data["structure"],
-        "liquidity": data["liquidity"],
-        "breakout": data["breakout"]
+        "confidence":
+            data["confidence"],
+
+        "score":
+            data["score"],
+
+        "reasons":
+            data["reasons"],
+
+        "warnings":
+            data["warnings"],
+
+        "trend":
+            data["trend"],
+
+        "momentum":
+            data["momentum"],
+
+        "structure":
+            data["structure"],
+
+        "liquidity":
+            data["liquidity"],
+
+        "breakout":
+            data["breakout"]
     }
 
 
@@ -718,19 +1192,30 @@ def build_trade_plan(
     ):
 
         return {
+
             "signal": "WAIT",
+
             "entry": None,
+
             "stop_loss": None,
+
             "target_1": None,
+
             "target_2": None,
+
             "target_3": None,
+
             "risk_reward": None,
+
             "invalidation": None,
-            "reason": ai.get(
-                "reasons",
-                []
-            )
+
+            "reason":
+                ai.get(
+                    "reasons",
+                    []
+                )
         }
+
 
     five = timeframes.get(
         "5min",
@@ -742,6 +1227,7 @@ def build_trade_plan(
         {}
     )
 
+
     support = (
         five.get("support")
         or fifteen.get("support")
@@ -752,13 +1238,20 @@ def build_trade_plan(
         or fifteen.get("resistance")
     )
 
-    entry = float(live_price)
+
+    entry = float(
+        live_price
+    )
+
 
     if ai["signal"] == "SELL":
 
         stop = (
             resistance
-            if resistance and resistance > entry
+            if (
+                resistance
+                and resistance > entry
+            )
             else entry * 1.005
         )
 
@@ -771,11 +1264,15 @@ def build_trade_plan(
         t2 = entry - 2 * risk
         t3 = entry - 3 * risk
 
+
     else:
 
         stop = (
             support
-            if support and support < entry
+            if (
+                support
+                and support < entry
+            )
             else entry * 0.995
         )
 
@@ -788,46 +1285,56 @@ def build_trade_plan(
         t2 = entry + 2 * risk
         t3 = entry + 3 * risk
 
+
     return {
-        "signal": ai["signal"],
 
-        "entry": round(
-            entry,
-            3
-        ),
+        "signal":
+            ai["signal"],
 
-        "stop_loss": round(
-            stop,
-            3
-        ),
+        "entry":
+            round(
+                entry,
+                3
+            ),
 
-        "target_1": round(
-            t1,
-            3
-        ),
+        "stop_loss":
+            round(
+                stop,
+                3
+            ),
 
-        "target_2": round(
-            t2,
-            3
-        ),
+        "target_1":
+            round(
+                t1,
+                3
+            ),
 
-        "target_3": round(
-            t3,
-            3
-        ),
+        "target_2":
+            round(
+                t2,
+                3
+            ),
+
+        "target_3":
+            round(
+                t3,
+                3
+            ),
 
         "risk_reward":
             "1:1 / 1:2 / 1:3",
 
-        "invalidation": round(
-            stop,
-            3
-        ),
+        "invalidation":
+            round(
+                stop,
+                3
+            ),
 
-        "reason": ai.get(
-            "reasons",
-            []
-        )
+        "reason":
+            ai.get(
+                "reasons",
+                []
+            )
     }
 
 
@@ -842,10 +1349,14 @@ def record_signal_history(
 
     with lock:
 
-        history = state["gold"].setdefault(
-            "signal_history",
-            []
+        history = (
+            state["gold"]
+            .setdefault(
+                "signal_history",
+                []
+            )
         )
+
 
         previous = (
             history[-1]
@@ -853,27 +1364,37 @@ def record_signal_history(
             else None
         )
 
+
         if (
             previous
             and previous.get("score")
             == ai["score"]
+
             and previous.get("signal")
             == ai["signal"]
         ):
+
             return
 
-        history.append(
-            {
-                "time": now_text(),
 
-                "price": (
-                    round(
-                        float(live_price),
-                        3
-                    )
-                    if live_price is not None
-                    else None
-                ),
+        history.append(
+
+            {
+
+                "time":
+                    now_text(),
+
+                "price":
+                    (
+                        round(
+                            float(
+                                live_price
+                            ),
+                            3
+                        )
+                        if live_price is not None
+                        else None
+                    ),
 
                 "score":
                     ai["score"],
@@ -892,9 +1413,49 @@ def record_signal_history(
             }
         )
 
+
         state["gold"][
             "signal_history"
         ] = history[-50:]
+
+
+# =========================================================
+# UPDATE ANALYSIS FROM CACHE
+# =========================================================
+
+def build_cached_timeframes():
+
+    timeframe_data = {}
+
+    for interval in CANDLE_INTERVALS:
+
+        cache = candle_cache[
+            interval
+        ]
+
+        candles = cache.get(
+            "candles",
+            []
+        )
+
+        if not candles:
+            continue
+
+        result = analyze_timeframe(
+            candles
+        )
+
+        if result:
+
+            result["candles"] = (
+                candles[-120:]
+            )
+
+            timeframe_data[
+                interval
+            ] = result
+
+    return timeframe_data
 
 
 # =========================================================
@@ -907,31 +1468,42 @@ def gold_analysis_loop():
 
         try:
 
-            timeframe_data = {}
+            # -------------------------------------------------
+            # Refresh only due timeframes.
+            # -------------------------------------------------
+
+            refreshed = False
 
             for interval in CANDLE_INTERVALS:
 
-                candles = get_candles(
-                    GOLD_SYMBOL,
-                    interval,
-                    100
-                )
+                try:
 
-                result = analyze_timeframe(
-                    candles
-                )
-
-                if result:
-
-                    result["candles"] = (
-                        candles[-120:]
+                    changed = (
+                        refresh_one_timeframe(
+                            interval
+                        )
                     )
 
-                    timeframe_data[
-                        interval
-                    ] = result
+                    if changed:
+                        refreshed = True
 
-                time.sleep(0.5)
+                except Exception as exc:
+
+                    print(
+                        "TIMEFRAME REFRESH ERROR:",
+                        interval,
+                        repr(exc)
+                    )
+
+
+            # -------------------------------------------------
+            # Build analysis from cached data.
+            # -------------------------------------------------
+
+            timeframe_data = (
+                build_cached_timeframes()
+            )
+
 
             if timeframe_data:
 
@@ -941,15 +1513,18 @@ def gold_analysis_loop():
                         "timeframes"
                     ] = timeframe_data
 
+
                 with lock:
 
                     live_price = (
                         state["gold"]["price"]
                     )
 
+
                 if live_price is None:
 
                     live_price = (
+
                         timeframe_data
                         .get(
                             "5min",
@@ -960,12 +1535,59 @@ def gold_analysis_loop():
                         )
                     )
 
-                if live_price is not None:
+
+                # -------------------------------------------------
+                # Need 5m data before producing AI signal.
+                # -------------------------------------------------
+
+                if (
+                    "5min" not in timeframe_data
+                    or len(
+                        timeframe_data[
+                            "5min"
+                        ].get(
+                            "candles",
+                            []
+                        )
+                    ) < 60
+                ):
+
+                    with lock:
+
+                        state["gold"][
+                            "data_status"
+                        ] = "LOADING"
+
+                        state["gold"][
+                            "data_message"
+                        ] = (
+                            "Waiting for enough "
+                            "5m candles."
+                        )
+
+                        state["gold"][
+                            "signal"
+                        ] = "WAIT"
+
+                        state["gold"][
+                            "confidence"
+                        ] = 25
+
+                    broadcast()
+
+                elif live_price is not None:
+
+                    # -------------------------------------------------
+                    # AI analysis
+                    # -------------------------------------------------
 
                     ai = build_ai_analysis(
+
                         timeframe_data,
+
                         live_price
                     )
+
 
                     five = (
                         timeframe_data
@@ -975,37 +1597,48 @@ def gold_analysis_loop():
                         )
                     )
 
+
                     trade_plan = (
                         build_trade_plan(
+
                             timeframe_data,
+
                             live_price,
+
                             ai
                         )
                     )
+
 
                     record_signal_history(
                         ai,
                         live_price
                     )
 
+
                     with lock:
 
                         state["gold"][
                             "candles"
                         ] = {
+
                             k: v.get(
                                 "candles",
                                 []
                             )
+
                             for k, v
                             in timeframe_data.items()
                         }
+
 
                         state["gold"][
                             "trade_plan"
                         ] = trade_plan
 
+
                         state["gold"].update(
+
                             {
 
                                 "trend":
@@ -1106,6 +1739,16 @@ def gold_analysis_loop():
                                         "UNKNOWN"
                                     ),
 
+                                "data_status":
+                                    "LIVE",
+
+                                "data_message":
+                                    (
+                                        "Using cached "
+                                        "multi-timeframe "
+                                        "market data."
+                                    ),
+
                                 "updated":
                                     now_text(),
 
@@ -1114,15 +1757,25 @@ def gold_analysis_loop():
                             }
                         )
 
+
                     print(
+
                         "AI UPDATE:",
+
                         f"price={live_price}",
+
                         f"score={ai['score']}",
+
                         f"decision={ai['signal']}",
-                        f"confidence={ai['confidence']}%"
+
+                        f"confidence={ai['confidence']}%",
+
+                        f"cached_timeframes={len(timeframe_data)}"
                     )
 
+
                     broadcast()
+
 
         except Exception as exc:
 
@@ -1131,7 +1784,32 @@ def gold_analysis_loop():
                 repr(exc)
             )
 
-        time.sleep(60)
+            with lock:
+
+                state["gold"][
+                    "error"
+                ] = str(exc)
+
+                state["gold"][
+                    "data_status"
+                ] = "DEGRADED"
+
+                state["gold"][
+                    "data_message"
+                ] = (
+                    "Using last valid market data."
+                )
+
+            broadcast()
+
+
+        # -----------------------------------------------------
+        # The loop itself is lightweight.
+        # Actual HTTP requests are controlled by the
+        # timeframe cache.
+        # -----------------------------------------------------
+
+        time.sleep(5)
 
 
 # =========================================================
@@ -1154,31 +1832,46 @@ def gold_websocket_loop():
                     "TWELVE_DATA_API_KEY is missing"
                 )
 
+
             print(
                 "Connecting Twelve Data Gold WebSocket..."
             )
 
+
             ws = websocket.create_connection(
+
                 WS_URL
                 + "?apikey="
                 + API_KEY,
+
                 timeout=20
             )
 
+
             subscribe = {
-                "action": "subscribe",
+
+                "action":
+                    "subscribe",
+
                 "params": {
-                    "symbols": GOLD_SYMBOL
+
+                    "symbols":
+                        GOLD_SYMBOL
                 }
             }
 
+
             ws.send(
-                json.dumps(subscribe)
+                json.dumps(
+                    subscribe
+                )
             )
+
 
             print(
                 "TWELVE DATA GOLD SUBSCRIBE SENT"
             )
+
 
             with lock:
 
@@ -1190,17 +1883,21 @@ def gold_websocket_loop():
                     "error"
                 ] = None
 
+
             broadcast()
+
 
             while True:
 
                 raw = ws.recv()
+
 
                 if not raw:
 
                     raise RuntimeError(
                         "WebSocket closed"
                     )
+
 
                 try:
 
@@ -1212,14 +1909,17 @@ def gold_websocket_loop():
 
                     continue
 
+
                 print(
                     "GOLD WS MESSAGE:",
                     message
                 )
 
+
                 event = message.get(
                     "event"
                 )
+
 
                 if event == "price":
 
@@ -1233,6 +1933,7 @@ def gold_websocket_loop():
                         )
                     )
 
+
                     if (
                         symbol == GOLD_SYMBOL
                         and price is not None
@@ -1242,6 +1943,7 @@ def gold_websocket_loop():
                             price
                         )
 
+
                 elif event == "subscribe-status":
 
                     print(
@@ -1249,9 +1951,11 @@ def gold_websocket_loop():
                         message
                     )
 
+
                 elif event == "heartbeat":
 
                     pass
+
 
                 elif event == "error":
 
@@ -1260,12 +1964,14 @@ def gold_websocket_loop():
                         message
                     )
 
+
         except Exception as exc:
 
             print(
                 "GOLD WEBSOCKET ERROR:",
                 repr(exc)
             )
+
 
             with lock:
 
@@ -1277,7 +1983,9 @@ def gold_websocket_loop():
                     "error"
                 ] = str(exc)
 
+
             broadcast()
+
 
         finally:
 
@@ -1289,10 +1997,12 @@ def gold_websocket_loop():
             except Exception:
                 pass
 
+
         print(
             f"Gold WebSocket reconnecting "
             f"in {reconnect_delay}s..."
         )
+
 
         time.sleep(
             reconnect_delay
@@ -1314,21 +2024,30 @@ def start_workers():
 
         workers_started = True
 
+
     print(
         "Starting Trading-AI workers..."
     )
 
+
     ws_thread = threading.Thread(
+
         target=gold_websocket_loop,
+
         daemon=True,
+
         name="GoldWebSocket"
     )
 
     ws_thread.start()
 
+
     ai_thread = threading.Thread(
+
         target=gold_analysis_loop,
+
         daemon=True,
+
         name="GoldAnalysis"
     )
 
@@ -1380,11 +2099,13 @@ def stream():
         maxsize=20
     )
 
+
     with clients_lock:
 
         clients.append(
             client_queue
         )
+
 
     def generate():
 
@@ -1393,14 +2114,21 @@ def stream():
             with lock:
 
                 initial = json.dumps(
+
                     state,
-                    separators=(",", ":")
+
+                    separators=(
+                        ",",
+                        ":"
+                    )
                 )
+
 
             yield (
                 "event: market\n"
                 f"data: {initial}\n\n"
             )
+
 
             while True:
 
@@ -1412,10 +2140,14 @@ def stream():
                         )
                     )
 
+
                     yield (
+
                         "event: market\n"
+
                         f"data: {payload}\n\n"
                     )
+
 
                 except queue.Empty:
 
@@ -1423,9 +2155,11 @@ def stream():
                         ": heartbeat\n\n"
                     )
 
+
         except GeneratorExit:
 
             pass
+
 
         finally:
 
@@ -1437,10 +2171,16 @@ def stream():
                         client_queue
                     )
 
+
     return Response(
+
         generate(),
-        mimetype="text/event-stream",
+
+        mimetype=
+            "text/event-stream",
+
         headers={
+
             "Cache-Control":
                 "no-cache",
 
@@ -1461,8 +2201,11 @@ def stream():
 def health():
 
     return jsonify(
+
         {
-            "status": "ok",
+
+            "status":
+                "ok",
 
             "service":
                 "Trading-AI",
@@ -1475,6 +2218,11 @@ def health():
             "gold_price":
                 state["gold"][
                     "price"
+                ],
+
+            "data_status":
+                state["gold"][
+                    "data_status"
                 ],
 
             "time":
@@ -1743,6 +2491,12 @@ font-size:11px
 margin-top:12px;
 color:#ffb3b3;
 font-size:12px
+}
+
+.status{
+margin-top:8px;
+font-size:11px;
+color:#78a5e5
 }
 
 .footer{
@@ -2119,6 +2873,13 @@ Updated
 ${g.updated||"—"}
 </div>
 
+<div class="status">
+Data:
+${g.data_status||"STARTING"}
+•
+${g.data_message||""}
+</div>
+
 
 <div class="metrics">
 
@@ -2481,9 +3242,7 @@ catch(err){
 console.error(err);
 
 }
-
-}
-);
+});
 
 </script>
 
