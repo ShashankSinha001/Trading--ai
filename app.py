@@ -10,18 +10,15 @@ from flask import Flask, jsonify, render_template_string
 
 
 # ============================================================
-# TRADING AI
+# TRADING AI - SINGLE PROCESS MARKET ENGINE
 # XAU/USD GOLD
-# LIVE WEBSOCKET + 5M HISTORY
-# MULTI-FACTOR ANALYSIS
 # ============================================================
 
 APP_NAME = "Trading AI"
-
-API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
-
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
+
+API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
 
 REST_URL = "https://api.twelvedata.com"
 WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -30,12 +27,11 @@ HISTORY_SIZE = 300
 
 app = Flask(__name__)
 
-
 # ============================================================
-# GLOBAL STATE
+# SHARED STATE
 # ============================================================
 
-state_lock = threading.RLock()
+lock = threading.RLock()
 
 candles = []
 
@@ -45,18 +41,16 @@ live_timestamp = None
 ws_connected = False
 ws_subscribed = False
 
-last_ws_message = None
-last_error = None
-
 history_loaded = False
 
-api_blocked_until = 0
+last_error = None
+last_ws_message = None
 
-workers_started = False
+engine_started = False
 
 
 # ============================================================
-# LOGGING
+# LOG
 # ============================================================
 
 def log(message):
@@ -64,7 +58,7 @@ def log(message):
 
 
 # ============================================================
-# NUMBER HELPERS
+# HELPERS
 # ============================================================
 
 def to_float(value):
@@ -74,7 +68,7 @@ def to_float(value):
         return None
 
 
-def safe_round(value, digits=3):
+def round_value(value, digits=3):
     if value is None:
         return None
 
@@ -83,145 +77,6 @@ def safe_round(value, digits=3):
     except Exception:
         return None
 
-
-# ============================================================
-# REST API
-# ============================================================
-
-def td_get(endpoint, params=None):
-    global api_blocked_until
-    global last_error
-
-    if not API_KEY:
-        raise RuntimeError("TWELVE_DATA_API_KEY is missing")
-
-    now = time.time()
-
-    if now < api_blocked_until:
-        remaining = int(api_blocked_until - now)
-        raise RuntimeError(
-            f"Twelve Data temporarily blocked after 429. "
-            f"Retry in {remaining}s."
-        )
-
-    params = dict(params or {})
-    params["apikey"] = API_KEY
-
-    url = f"{REST_URL}/{endpoint}"
-
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
-        )
-
-        if response.status_code == 429:
-            api_blocked_until = time.time() + 3600
-
-            raise RuntimeError(
-                f"Twelve Data HTTP 429: {response.text[:500]}"
-            )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, dict):
-            if data.get("status") == "error":
-                raise RuntimeError(
-                    f"Twelve Data error: {data}"
-                )
-
-        return data
-
-    except Exception as exc:
-        last_error = str(exc)
-        raise
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def load_history():
-    global candles
-    global history_loaded
-    global last_error
-
-    log("Loading XAU/USD 5-minute history...")
-
-    try:
-        data = td_get(
-            "time_series",
-            {
-                "symbol": SYMBOL,
-                "interval": INTERVAL,
-                "outputsize": HISTORY_SIZE,
-                "timezone": "UTC",
-                "order": "asc",
-            }
-        )
-
-        values = data.get("values", [])
-
-        parsed = []
-
-        for item in values:
-            dt = item.get("datetime")
-
-            o = to_float(item.get("open"))
-            h = to_float(item.get("high"))
-            l = to_float(item.get("low"))
-            c = to_float(item.get("close"))
-
-            if not dt or None in (o, h, l, c):
-                continue
-
-            parsed.append(
-                {
-                    "datetime": dt,
-                    "timestamp": parse_datetime(dt),
-                    "open": o,
-                    "high": h,
-                    "low": l,
-                    "close": c,
-                    "volume": to_float(item.get("volume")) or 0.0,
-                }
-            )
-
-        if not parsed:
-            raise RuntimeError(
-                "Twelve Data returned no usable candles."
-            )
-
-        with state_lock:
-            candles = parsed[-HISTORY_SIZE:]
-            history_loaded = True
-
-        log(
-            f"History loaded successfully: "
-            f"{len(candles)} candles"
-        )
-
-        last = candles[-1]
-
-        log(
-            f"LAST HISTORY CANDLE: "
-            f"{last['datetime']} "
-            f"close={last['close']}"
-        )
-
-    except Exception as exc:
-        history_loaded = False
-        last_error = str(exc)
-
-        log(f"HISTORY ERROR: {repr(exc)}")
-
-
-# ============================================================
-# DATETIME
-# ============================================================
 
 def parse_datetime(value):
     try:
@@ -247,10 +102,6 @@ def parse_datetime(value):
         return time.time()
 
 
-# ============================================================
-# 5 MINUTE BUCKET
-# ============================================================
-
 def candle_bucket(timestamp):
     return int(timestamp // 300) * 300
 
@@ -263,10 +114,121 @@ def bucket_datetime(timestamp):
 
 
 # ============================================================
-# LIVE CANDLE UPDATE
+# REST - HISTORY ONLY
+# ============================================================
+
+def load_history():
+
+    global candles
+    global history_loaded
+    global last_error
+
+    if not API_KEY:
+        last_error = "TWELVE_DATA_API_KEY missing"
+        log(last_error)
+        return
+
+    log("Loading XAU/USD 5-minute history...")
+
+    try:
+
+        response = requests.get(
+            f"{REST_URL}/time_series",
+            params={
+                "symbol": SYMBOL,
+                "interval": INTERVAL,
+                "outputsize": HISTORY_SIZE,
+                "timezone": "UTC",
+                "order": "asc",
+                "apikey": API_KEY,
+            },
+            timeout=20
+        )
+
+        if response.status_code == 429:
+            raise RuntimeError(
+                "Twelve Data HTTP 429 - daily API limit reached"
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("status") == "error":
+            raise RuntimeError(str(data))
+
+        values = data.get("values", [])
+
+        parsed = []
+
+        for item in values:
+
+            dt_text = item.get("datetime")
+
+            o = to_float(item.get("open"))
+            h = to_float(item.get("high"))
+            l = to_float(item.get("low"))
+            c = to_float(item.get("close"))
+
+            if not dt_text:
+                continue
+
+            if None in (o, h, l, c):
+                continue
+
+            timestamp = parse_datetime(dt_text)
+
+            parsed.append(
+                {
+                    "datetime": dt_text,
+                    "timestamp": timestamp,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": to_float(
+                        item.get("volume")
+                    ) or 0.0,
+                }
+            )
+
+        if not parsed:
+            raise RuntimeError(
+                "No usable historical candles returned"
+            )
+
+        with lock:
+
+            candles = parsed[-HISTORY_SIZE:]
+
+            history_loaded = True
+
+        log(
+            f"History loaded successfully: "
+            f"{len(candles)} candles"
+        )
+
+        log(
+            f"LAST HISTORY CLOSE: "
+            f"{candles[-1]['close']}"
+        )
+
+    except Exception as exc:
+
+        history_loaded = False
+        last_error = str(exc)
+
+        log(
+            f"HISTORY ERROR: {repr(exc)}"
+        )
+
+
+# ============================================================
+# LIVE CANDLE
 # ============================================================
 
 def update_live_candle(price, timestamp=None):
+
     global live_price
     global live_timestamp
     global candles
@@ -279,13 +241,18 @@ def update_live_candle(price, timestamp=None):
     if timestamp is None:
         timestamp = time.time()
 
+    # milliseconds → seconds
+    if timestamp > 10_000_000_000:
+        timestamp = timestamp / 1000.0
+
     bucket = candle_bucket(timestamp)
 
-    with state_lock:
+    with lock:
 
         live_price = price
         live_timestamp = timestamp
 
+        # No history yet
         if not candles:
 
             candles.append(
@@ -305,29 +272,29 @@ def update_live_candle(price, timestamp=None):
         last = candles[-1]
 
         last_bucket = candle_bucket(
-            last.get("timestamp", timestamp)
+            last["timestamp"]
         )
 
         # ----------------------------------------------------
-        # SAME 5 MINUTE CANDLE
+        # SAME 5 MIN CANDLE
         # ----------------------------------------------------
 
         if bucket == last_bucket:
 
             last["high"] = max(
-                float(last["high"]),
+                last["high"],
                 price
             )
 
             last["low"] = min(
-                float(last["low"]),
+                last["low"],
                 price
             )
 
             last["close"] = price
 
         # ----------------------------------------------------
-        # NEW 5 MINUTE CANDLE
+        # NEW 5 MIN CANDLE
         # ----------------------------------------------------
 
         elif bucket > last_bucket:
@@ -347,10 +314,6 @@ def update_live_candle(price, timestamp=None):
             if len(candles) > HISTORY_SIZE:
                 candles = candles[-HISTORY_SIZE:]
 
-        # ----------------------------------------------------
-        # OUT OF ORDER MESSAGE
-        # ----------------------------------------------------
-
         else:
             return False
 
@@ -358,22 +321,68 @@ def update_live_candle(price, timestamp=None):
 
 
 # ============================================================
-# WEBSOCKET MESSAGE PARSER
+# WEBSOCKET
 # ============================================================
 
-def process_ws_message(raw_message):
-    global last_ws_message
-    global last_error
-    global ws_subscribed
+def websocket_open(ws):
 
-    last_ws_message = raw_message
+    global ws_connected
+    global ws_subscribed
+    global last_error
+
+    ws_connected = True
+    ws_subscribed = False
+    last_error = None
+
+    log("WebSocket connected")
+
+    message = {
+        "action": "subscribe",
+        "params": {
+            "symbols": SYMBOL
+        }
+    }
 
     try:
-        data = json.loads(raw_message)
+
+        ws.send(
+            json.dumps(message)
+        )
+
+        log(
+            f"Subscribed to {SYMBOL}"
+        )
 
     except Exception as exc:
-        last_error = f"WS JSON parse error: {exc}"
-        log(f"WEBSOCKET JSON ERROR: {raw_message[:500]}")
+
+        last_error = str(exc)
+
+        log(
+            f"SUBSCRIBE ERROR: {repr(exc)}"
+        )
+
+
+def websocket_message(ws, message):
+
+    global ws_subscribed
+    global last_ws_message
+    global last_error
+
+    last_ws_message = message
+
+    try:
+
+        data = json.loads(message)
+
+    except Exception as exc:
+
+        last_error = str(exc)
+
+        log(
+            f"WEBSOCKET JSON ERROR: "
+            f"{repr(exc)}"
+        )
+
         return
 
     if not isinstance(data, dict):
@@ -381,26 +390,33 @@ def process_ws_message(raw_message):
 
     event = data.get("event")
 
-    # ========================================================
-    # SUBSCRIPTION STATUS
-    # ========================================================
+    # --------------------------------------------------------
+    # SUBSCRIPTION
+    # --------------------------------------------------------
 
     if event == "subscribe-status":
 
-        status = data.get("status")
-
         log(
-            f"SUBSCRIBE STATUS: {json.dumps(data)[:800]}"
+            "SUBSCRIBE STATUS: "
+            + json.dumps(data)[:700]
         )
 
-        if status in ("ok", "success"):
+        status = str(
+            data.get("status", "")
+        ).lower()
+
+        if status in (
+            "ok",
+            "success",
+            "subscribed"
+        ):
             ws_subscribed = True
 
         return
 
-    # ========================================================
-    # PRICE EVENT
-    # ========================================================
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
 
     if event == "price":
 
@@ -415,32 +431,34 @@ def process_ws_message(raw_message):
             or time.time()
         )
 
-        timestamp = to_float(timestamp)
-
-        # Some APIs can return milliseconds.
-        if timestamp and timestamp > 10_000_000_000:
-            timestamp = timestamp / 1000.0
-
         price = to_float(price)
+        timestamp = to_float(timestamp)
 
         if price is None:
             log(
-                "PRICE EVENT RECEIVED BUT PRICE IS MISSING: "
-                + str(data)[:1000]
+                "PRICE EVENT WITHOUT PRICE: "
+                + json.dumps(data)[:1000]
             )
             return
+
+        if timestamp is None:
+            timestamp = time.time()
+
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
 
         log(
             f"PRICE RECEIVED: "
             f"{SYMBOL} = {price}"
         )
 
-        ok = update_live_candle(
+        updated = update_live_candle(
             price,
             timestamp
         )
 
-        if ok:
+        if updated:
+
             log(
                 f"LIVE CANDLE UPDATED: "
                 f"{price}"
@@ -448,41 +466,36 @@ def process_ws_message(raw_message):
 
         return
 
-    # ========================================================
-    # ERROR EVENT
-    # ========================================================
+    # --------------------------------------------------------
+    # ERROR
+    # --------------------------------------------------------
 
     if event == "error":
 
         last_error = str(data)
 
         log(
-            f"WEBSOCKET SERVER ERROR: "
-            f"{json.dumps(data)[:1000]}"
+            "WEBSOCKET SERVER ERROR: "
+            + json.dumps(data)[:1000]
         )
 
         return
 
-    # ========================================================
-    # HEARTBEAT / OTHER
-    # ========================================================
-
-    if event in ("heartbeat", "hearbeat"):
-        return
-
-    # ========================================================
-    # UNKNOWN MESSAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # FALLBACK PRICE
+    # --------------------------------------------------------
 
     if "price" in data:
 
-        price = to_float(data.get("price"))
+        price = to_float(
+            data.get("price")
+        )
 
         if price is not None:
 
             log(
-                f"PRICE RECEIVED (fallback): "
-                f"{SYMBOL} = {price}"
+                f"PRICE RECEIVED FALLBACK: "
+                f"{price}"
             )
 
             update_live_candle(
@@ -491,53 +504,25 @@ def process_ws_message(raw_message):
             )
 
 
-# ============================================================
-# WEBSOCKET OPEN
-# ============================================================
+def websocket_error(ws, error):
 
-def websocket_open(ws):
     global ws_connected
-    global ws_subscribed
     global last_error
 
-    ws_connected = True
-    ws_subscribed = False
-    last_error = None
+    ws_connected = False
+    last_error = str(error)
 
-    log("WebSocket connected")
-
-    subscribe_message = {
-        "action": "subscribe",
-        "params": {
-            "symbols": SYMBOL
-        }
-    }
-
-    try:
-
-        ws.send(
-            json.dumps(subscribe_message)
-        )
-
-        log(
-            f"Subscribed to {SYMBOL}"
-        )
-
-    except Exception as exc:
-
-        last_error = str(exc)
-
-        log(
-            f"WEBSOCKET SUBSCRIBE ERROR: "
-            f"{repr(exc)}"
-        )
+    log(
+        f"WEBSOCKET ERROR: {repr(error)}"
+    )
 
 
-# ============================================================
-# WEBSOCKET CLOSE
-# ============================================================
+def websocket_close(
+    ws,
+    close_status_code,
+    close_msg
+):
 
-def websocket_close(ws, close_status_code, close_msg):
     global ws_connected
     global ws_subscribed
 
@@ -551,26 +536,6 @@ def websocket_close(ws, close_status_code, close_msg):
     )
 
 
-# ============================================================
-# WEBSOCKET ERROR
-# ============================================================
-
-def websocket_error(ws, error):
-    global ws_connected
-    global last_error
-
-    ws_connected = False
-    last_error = str(error)
-
-    log(
-        f"WEBSOCKET ERROR: {repr(error)}"
-    )
-
-
-# ============================================================
-# WEBSOCKET LOOP
-# ============================================================
-
 def websocket_loop():
 
     global ws_connected
@@ -579,17 +544,14 @@ def websocket_loop():
     if not API_KEY:
 
         log(
-            "WEBSOCKET NOT STARTED: "
-            "TWELVE_DATA_API_KEY missing"
+            "WebSocket not started: API key missing"
         )
 
         return
 
     log(
         "Starting WebSocket for "
-        f"{SYMBOL} "
-        f"(API key present: yes, "
-        f"length: {len(API_KEY)})"
+        f"{SYMBOL}"
     )
 
     while True:
@@ -602,12 +564,12 @@ def websocket_loop():
             )
 
             ws = websocket.WebSocketApp(
+
                 ws_url,
 
                 on_open=websocket_open,
 
-                on_message=lambda ws, message:
-                    process_ws_message(message),
+                on_message=websocket_message,
 
                 on_error=websocket_error,
 
@@ -617,13 +579,9 @@ def websocket_loop():
             ws.run_forever(
                 ping_interval=20,
                 ping_timeout=10,
-                ping_payload="ping",
             )
 
         except Exception as exc:
-
-            ws_connected = False
-            ws_subscribed = False
 
             log(
                 f"WEBSOCKET LOOP ERROR: "
@@ -641,29 +599,32 @@ def websocket_loop():
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# INDICATORS
 # ============================================================
 
-def ema(values, period):
+def calculate_ema(values, period):
+
     if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
 
-    result = sum(
-        values[:period]
-    ) / period
+    result = (
+        sum(values[:period]) /
+        period
+    )
 
-    for price in values[period:]:
+    for value in values[period:]:
 
         result = (
-            (price - result) * multiplier
+            (value - result) *
+            multiplier
         ) + result
 
     return result
 
 
-def rsi(values, period=14):
+def calculate_rsi(values, period=14):
 
     if len(values) < period + 1:
         return None
@@ -673,17 +634,17 @@ def rsi(values, period=14):
 
     for i in range(1, len(values)):
 
-        diff = (
+        change = (
             values[i] -
             values[i - 1]
         )
 
         gains.append(
-            max(diff, 0)
+            max(change, 0)
         )
 
         losses.append(
-            max(-diff, 0)
+            max(-change, 0)
         )
 
     avg_gain = (
@@ -696,15 +657,24 @@ def rsi(values, period=14):
         period
     )
 
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain *
+                (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss *
+                (period - 1)
+            )
             + losses[i]
         ) / period
 
@@ -718,46 +688,54 @@ def rsi(values, period=14):
     )
 
 
-def atr(candle_data, period=14):
+def calculate_atr(data, period=14):
 
-    if len(candle_data) < period + 1:
+    if len(data) < period + 1:
         return None
 
-    true_ranges = []
+    ranges = []
 
-    for i in range(1, len(candle_data)):
+    for i in range(1, len(data)):
 
-        current = candle_data[i]
-        previous = candle_data[i - 1]
+        current = data[i]
+        previous = data[i - 1]
 
         high = float(current["high"])
         low = float(current["low"])
-        prev_close = float(previous["close"])
-
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
+        previous_close = float(
+            previous["close"]
         )
 
-        true_ranges.append(tr)
+        true_range = max(
+            high - low,
+            abs(
+                high -
+                previous_close
+            ),
+            abs(
+                low -
+                previous_close
+            ),
+        )
 
-    if len(true_ranges) < period:
+        ranges.append(true_range)
+
+    if len(ranges) < period:
         return None
 
     return (
-        sum(true_ranges[-period:]) /
+        sum(ranges[-period:]) /
         period
     )
 
 
 # ============================================================
-# MARKET ANALYSIS
+# ANALYSIS ENGINE
 # ============================================================
 
 def calculate_analysis():
 
-    with state_lock:
+    with lock:
 
         data = list(candles)
         price = live_price
@@ -767,17 +745,25 @@ def calculate_analysis():
         return {
             "signal": "WAIT",
             "strength": 0,
+
             "trend": "WAIT",
             "momentum": "WAIT",
             "structure": "INSUFFICIENT",
+
             "rsi": None,
             "ema20": None,
             "ema50": None,
             "atr": None,
+
             "liquidity_high": None,
             "liquidity_low": None,
+
             "breakout": "WAIT",
             "volatility": "WAIT",
+
+            "buy_score": 0,
+            "sell_score": 0,
+
             "candle_count": len(data),
         }
 
@@ -796,30 +782,30 @@ def calculate_analysis():
         for x in data
     ]
 
-    ema20 = ema(
-        closes,
-        20
-    )
-
-    ema50 = ema(
-        closes,
-        50
-    )
-
-    rsi14 = rsi(
-        closes,
-        14
-    )
-
-    atr14 = atr(
-        data,
-        14
-    )
-
     current_price = (
         price
         if price is not None
         else closes[-1]
+    )
+
+    ema20 = calculate_ema(
+        closes,
+        20
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        50
+    )
+
+    rsi14 = calculate_rsi(
+        closes,
+        14
+    )
+
+    atr14 = calculate_atr(
+        data,
+        14
     )
 
     # ========================================================
@@ -828,24 +814,31 @@ def calculate_analysis():
 
     trend = "WAIT"
 
-    if ema20 is not None and ema50 is not None:
+    if (
+        ema20 is not None
+        and ema50 is not None
+    ):
 
         if (
             current_price > ema20
             and ema20 > ema50
         ):
+
             trend = "BULLISH"
 
         elif (
             current_price < ema20
             and ema20 < ema50
         ):
+
             trend = "BEARISH"
 
         elif current_price > ema50:
+
             trend = "MIXED-UP"
 
         elif current_price < ema50:
+
             trend = "MIXED-DOWN"
 
     # ========================================================
@@ -857,67 +850,80 @@ def calculate_analysis():
     if rsi14 is not None:
 
         if rsi14 >= 60:
+
             momentum = "BULLISH"
 
         elif rsi14 <= 40:
+
             momentum = "BEARISH"
 
         else:
+
             momentum = "NEUTRAL"
 
     # ========================================================
-    # MARKET STRUCTURE
+    # STRUCTURE
     # ========================================================
 
     recent = data[-20:]
+    previous = data[-40:-20]
 
     recent_high = max(
-        float(x["high"])
+        x["high"]
         for x in recent
     )
 
     recent_low = min(
-        float(x["low"])
+        x["low"]
         for x in recent
     )
 
-    previous = data[-10:-1]
-
     previous_high = max(
-        float(x["high"])
+        x["high"]
         for x in previous
     )
 
     previous_low = min(
-        float(x["low"])
+        x["low"]
         for x in previous
     )
 
     if (
-        current_price > recent_high
-        and current_price > previous_high
+        current_price >
+        recent_high
     ):
+
         structure = "BREAKOUT-UP"
 
     elif (
-        current_price < recent_low
-        and current_price < previous_low
+        current_price <
+        recent_low
     ):
+
         structure = "BREAKOUT-DOWN"
 
     elif (
-        recent_high > previous_high
-        and recent_low > previous_low
+        recent_high >
+        previous_high
+        and
+        recent_low >
+        previous_low
     ):
+
         structure = "HIGHER-HIGH / LOW"
 
     elif (
-        recent_high < previous_high
-        and recent_low < previous_low
+        recent_high <
+        previous_high
+        and
+        recent_low <
+        previous_low
     ):
+
         structure = "LOWER-HIGH / LOW"
 
     else:
+
         structure = "RANGE"
 
     # ========================================================
@@ -939,9 +945,11 @@ def calculate_analysis():
     breakout = "WAIT"
 
     if current_price > liquidity_high:
+
         breakout = "UP"
 
     elif current_price < liquidity_low:
+
         breakout = "DOWN"
 
     # ========================================================
@@ -958,13 +966,15 @@ def calculate_analysis():
         )
 
         if last_range > atr14 * 1.8:
+
             volatility = "HIGH"
 
         elif last_range < atr14 * 0.5:
+
             volatility = "LOW"
 
     # ========================================================
-    # MULTI-FACTOR SCORE
+    # SCORE
     # ========================================================
 
     buy_score = 0
@@ -991,41 +1001,48 @@ def calculate_analysis():
         sell_score += 20
 
     # Structure
-    if (
-        structure == "BREAKOUT-UP"
-        or structure == "HIGHER-HIGH / LOW"
+    if structure in (
+        "BREAKOUT-UP",
+        "HIGHER-HIGH / LOW"
     ):
+
         buy_score += 25
 
-    elif (
-        structure == "BREAKOUT-DOWN"
-        or structure == "LOWER-HIGH / LOW"
+    elif structure in (
+        "BREAKOUT-DOWN",
+        "LOWER-HIGH / LOW"
     ):
+
         sell_score += 25
 
-    # RSI confirmation
+    # RSI
     if rsi14 is not None:
 
         if 55 <= rsi14 <= 70:
+
             buy_score += 15
 
         elif 30 <= rsi14 <= 45:
+
             sell_score += 15
 
-        # Avoid blindly chasing extreme RSI
         elif rsi14 > 75:
+
             buy_score -= 10
 
         elif rsi14 < 25:
+
             sell_score -= 10
 
-    # Price vs EMA50
+    # EMA50
     if ema50 is not None:
 
         if current_price > ema50:
+
             buy_score += 10
 
         elif current_price < ema50:
+
             sell_score += 10
 
     # ========================================================
@@ -1033,7 +1050,8 @@ def calculate_analysis():
     # ========================================================
 
     difference = abs(
-        buy_score - sell_score
+        buy_score -
+        sell_score
     )
 
     strength = max(
@@ -1043,24 +1061,24 @@ def calculate_analysis():
 
     signal = "WAIT"
 
-    # Need enough agreement between factors
     if (
         buy_score >= 60
         and difference >= 20
     ):
+
         signal = "BUY"
 
     elif (
         sell_score >= 60
         and difference >= 20
     ):
+
         signal = "SELL"
 
-    else:
-        signal = "WAIT"
-
     return {
+
         "signal": signal,
+
         "strength": int(
             max(
                 0,
@@ -1078,32 +1096,32 @@ def calculate_analysis():
         "momentum": momentum,
         "structure": structure,
 
-        "rsi": safe_round(
+        "rsi": round_value(
             rsi14,
             2
         ),
 
-        "ema20": safe_round(
+        "ema20": round_value(
             ema20,
             3
         ),
 
-        "ema50": safe_round(
+        "ema50": round_value(
             ema50,
             3
         ),
 
-        "atr": safe_round(
+        "atr": round_value(
             atr14,
             3
         ),
 
-        "liquidity_high": safe_round(
+        "liquidity_high": round_value(
             liquidity_high,
             3
         ),
 
-        "liquidity_low": safe_round(
+        "liquidity_low": round_value(
             liquidity_low,
             3
         ),
@@ -1116,7 +1134,7 @@ def calculate_analysis():
 
 
 # ============================================================
-# MARKET API
+# API
 # ============================================================
 
 @app.route("/api/market")
@@ -1124,23 +1142,20 @@ def market_api():
 
     analysis = calculate_analysis()
 
-    with state_lock:
-
-        price = live_price
+    with lock:
 
         result = {
             "app": APP_NAME,
             "symbol": SYMBOL,
 
-            "price": safe_round(
-                price,
+            "price": round_value(
+                live_price,
                 3
             ),
 
             "timestamp": live_timestamp,
 
             "connected": ws_connected,
-
             "subscribed": ws_subscribed,
 
             "history_loaded": history_loaded,
@@ -1153,14 +1168,10 @@ def market_api():
     return jsonify(result)
 
 
-# ============================================================
-# CANDLES API
-# ============================================================
-
 @app.route("/api/candles")
 def candles_api():
 
-    with state_lock:
+    with lock:
 
         result = []
 
@@ -1168,30 +1179,26 @@ def candles_api():
 
             result.append(
                 {
-                    "datetime": candle.get(
-                        "datetime"
-                    ),
+                    "datetime":
+                        candle["datetime"],
 
-                    "open": candle.get(
-                        "open"
-                    ),
+                    "open":
+                        candle["open"],
 
-                    "high": candle.get(
-                        "high"
-                    ),
+                    "high":
+                        candle["high"],
 
-                    "low": candle.get(
-                        "low"
-                    ),
+                    "low":
+                        candle["low"],
 
-                    "close": candle.get(
-                        "close"
-                    ),
+                    "close":
+                        candle["close"],
 
-                    "volume": candle.get(
-                        "volume",
-                        0
-                    ),
+                    "volume":
+                        candle.get(
+                            "volume",
+                            0
+                        ),
                 }
             )
 
@@ -1205,35 +1212,49 @@ def candles_api():
     )
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
 @app.route("/health")
 def health():
 
-    return jsonify(
-        {
-            "status": "ok",
-            "app": APP_NAME,
-            "symbol": SYMBOL,
-            "api_key_present": bool(API_KEY),
-            "api_key_length": len(API_KEY),
-            "ws_connected": ws_connected,
-            "ws_subscribed": ws_subscribed,
-            "history_loaded": history_loaded,
-            "candle_count": len(candles),
-            "live_price": live_price,
-            "last_error": last_error,
-        }
-    )
+    with lock:
+
+        return jsonify(
+            {
+                "status": "ok",
+                "app": APP_NAME,
+                "symbol": SYMBOL,
+
+                "api_key_present":
+                    bool(API_KEY),
+
+                "api_key_length":
+                    len(API_KEY),
+
+                "ws_connected":
+                    ws_connected,
+
+                "ws_subscribed":
+                    ws_subscribed,
+
+                "history_loaded":
+                    history_loaded,
+
+                "candle_count":
+                    len(candles),
+
+                "live_price":
+                    live_price,
+
+                "last_error":
+                    last_error,
+            }
+        )
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
 
 <html>
@@ -1243,7 +1264,7 @@ HTML = r"""
 <meta charset="UTF-8">
 
 <meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+content="width=device-width, initial-scale=1.0">
 
 <title>Trading AI</title>
 
@@ -1256,8 +1277,8 @@ HTML = r"""
 body {
     margin: 0;
     background: #07111f;
-    color: #eaf2ff;
-    font-family: Arial, Helvetica, sans-serif;
+    color: #edf4ff;
+    font-family: Arial, sans-serif;
 }
 
 .container {
@@ -1270,7 +1291,7 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 22px;
+    margin-bottom: 20px;
 }
 
 .logo {
@@ -1279,29 +1300,37 @@ body {
 }
 
 .symbol {
-    color: #9eb2cc;
+    color: #8ea4be;
     margin-top: 5px;
 }
 
 .connection {
     padding: 8px 14px;
     border-radius: 20px;
-    background: #18263a;
+    background: #17283d;
+    font-size: 12px;
     font-weight: bold;
-    font-size: 13px;
+}
+
+.price-card,
+.card {
+    background: #0c1a2b;
+    border: 1px solid #1e334c;
+    border-radius: 16px;
 }
 
 .price-card {
-    background: #0c1a2b;
-    border: 1px solid #1e3149;
-    border-radius: 18px;
     padding: 28px;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
+}
+
+.card {
+    padding: 20px;
 }
 
 .label {
-    color: #91a4bc;
-    font-size: 13px;
+    color: #8ea4be;
+    font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 1px;
 }
@@ -1312,51 +1341,36 @@ body {
     margin-top: 8px;
 }
 
+.signal {
+    font-size: 32px;
+    font-weight: 900;
+    margin-top: 8px;
+}
+
 .grid {
     display: grid;
     grid-template-columns:
         repeat(auto-fit, minmax(180px, 1fr));
+
     gap: 14px;
 }
 
-.card {
-    background: #0c1a2b;
-    border: 1px solid #1e3149;
-    border-radius: 16px;
-    padding: 20px;
-}
-
-.card-title {
-    color: #91a4bc;
-    font-size: 12px;
-    text-transform: uppercase;
-}
-
 .card-value {
-    font-size: 22px;
+    font-size: 21px;
     font-weight: 700;
     margin-top: 10px;
 }
 
-.signal {
-    font-size: 34px;
-    font-weight: 900;
-}
-
-.wait {
-    color: #d7dee8;
-}
-
 .small {
-    color: #8195ad;
+    color: #7f94ad;
     font-size: 12px;
-    margin-top: 7px;
+    margin-top: 8px;
 }
 
 .status {
-    margin-top: 20px;
-    color: #91a4bc;
-    font-size: 13px;
+    margin-top: 18px;
+    color: #8297b0;
+    font-size: 12px;
 }
 
 </style>
@@ -1367,213 +1381,218 @@ body {
 
 <div class="container">
 
-    <div class="header">
+<div class="header">
 
-        <div>
+<div>
 
-            <div class="logo">
-                Trading AI
-            </div>
+<div class="logo">
+Trading AI
+</div>
 
-            <div class="symbol">
-                XAU/USD • GOLD
-            </div>
+<div class="symbol">
+XAU/USD • GOLD
+</div>
 
-        </div>
+</div>
 
-        <div
-            id="connection"
-            class="connection">
-            CONNECTING
-        </div>
+<div
+id="connection"
+class="connection">
+CONNECTING
+</div>
 
-    </div>
-
-
-    <div class="price-card">
-
-        <div class="label">
-            Live Gold Price
-        </div>
-
-        <div
-            id="price"
-            class="price">
-            --
-        </div>
-
-        <div
-            id="priceStatus"
-            class="small">
-            Waiting for live candle data...
-        </div>
-
-    </div>
+</div>
 
 
-    <div class="card"
-         style="margin-bottom:18px;">
+<div class="price-card">
 
-        <div class="label">
-            AI Market Signal
-        </div>
+<div class="label">
+Live Gold Price
+</div>
 
-        <div
-            id="signal"
-            class="signal wait">
-            WAIT
-        </div>
+<div
+id="price"
+class="price">
+--
+</div>
 
-        <div
-            id="strength"
-            class="small">
-            Strength: 0%
-        </div>
+<div
+id="priceStatus"
+class="small">
+Waiting for live candle data...
+</div>
 
-    </div>
-
-
-    <div class="grid">
-
-        <div class="card">
-
-            <div class="card-title">
-                Trend
-            </div>
-
-            <div
-                id="trend"
-                class="card-value">
-                WAIT
-            </div>
-
-        </div>
+</div>
 
 
-        <div class="card">
+<div
+class="card"
+style="margin-bottom:16px;">
 
-            <div class="card-title">
-                Momentum
-            </div>
+<div class="label">
+AI Market Signal
+</div>
 
-            <div
-                id="momentum"
-                class="card-value">
-                WAIT
-            </div>
+<div
+id="signal"
+class="signal">
+WAIT
+</div>
 
-        </div>
+<div
+id="strength"
+class="small">
+Strength: 0%
+</div>
 
-
-        <div class="card">
-
-            <div class="card-title">
-                Structure
-            </div>
-
-            <div
-                id="structure"
-                class="card-value">
-                INSUFFICIENT
-            </div>
-
-        </div>
+</div>
 
 
-        <div class="card">
-
-            <div class="card-title">
-                RSI
-            </div>
-
-            <div
-                id="rsi"
-                class="card-value">
-                --
-            </div>
-
-        </div>
+<div class="grid">
 
 
-        <div class="card">
+<div class="card">
 
-            <div class="card-title">
-                EMA 20
-            </div>
+<div class="label">
+Trend
+</div>
 
-            <div
-                id="ema20"
-                class="card-value">
-                --
-            </div>
+<div
+id="trend"
+class="card-value">
+WAIT
+</div>
 
-        </div>
-
-
-        <div class="card">
-
-            <div class="card-title">
-                EMA 50
-            </div>
-
-            <div
-                id="ema50"
-                class="card-value">
-                --
-            </div>
-
-        </div>
+</div>
 
 
-        <div class="card">
+<div class="card">
 
-            <div class="card-title">
-                Liquidity High
-            </div>
+<div class="label">
+Momentum
+</div>
 
-            <div
-                id="liqHigh"
-                class="card-value">
-                --
-            </div>
+<div
+id="momentum"
+class="card-value">
+WAIT
+</div>
 
-        </div>
-
-
-        <div class="card">
-
-            <div class="card-title">
-                Liquidity Low
-            </div>
-
-            <div
-                id="liqLow"
-                class="card-value">
-                --
-            </div>
-
-        </div>
-
-    </div>
+</div>
 
 
-    <div
-        id="status"
-        class="status">
-        Initializing market engine...
-    </div>
+<div class="card">
+
+<div class="label">
+Structure
+</div>
+
+<div
+id="structure"
+class="card-value">
+INSUFFICIENT
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+RSI
+</div>
+
+<div
+id="rsi"
+class="card-value">
+--
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+EMA 20
+</div>
+
+<div
+id="ema20"
+class="card-value">
+--
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+EMA 50
+</div>
+
+<div
+id="ema50"
+class="card-value">
+--
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+Liquidity High
+</div>
+
+<div
+id="liqHigh"
+class="card-value">
+--
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+Liquidity Low
+</div>
+
+<div
+id="liqLow"
+class="card-value">
+--
+</div>
+
+</div>
+
+
+</div>
+
+
+<div
+id="status"
+class="status">
+Starting market engine...
+</div>
 
 </div>
 
 
 <script>
 
-function setText(id, value) {
+function text(id, value) {
 
-    const el = document.getElementById(id);
+    const element =
+        document.getElementById(id);
 
-    if (el) {
-        el.textContent =
+    if (element) {
+
+        element.textContent =
             value === null ||
             value === undefined
             ? "--"
@@ -1582,175 +1601,14 @@ function setText(id, value) {
 }
 
 
-function updateMarket(data) {
-
-    const connected =
-        data.connected === true;
-
-    const subscribed =
-        data.subscribed === true;
-
-    const connection =
-        document.getElementById(
-            "connection"
-        );
-
-    if (connected && subscribed) {
-
-        connection.textContent =
-            "LIVE";
-
-    } else if (connected) {
-
-        connection.textContent =
-            "CONNECTED";
-
-    } else {
-
-        connection.textContent =
-            "RECONNECTING";
-    }
-
-
-    setText(
-        "price",
-        data.price !== null &&
-        data.price !== undefined
-            ? Number(data.price).toFixed(3)
-            : "--"
-    );
-
-
-    setText(
-        "signal",
-        data.signal || "WAIT"
-    );
-
-
-    setText(
-        "strength",
-        "Strength: " +
-        (data.strength || 0) +
-        "%"
-    );
-
-
-    setText(
-        "trend",
-        data.trend || "WAIT"
-    );
-
-
-    setText(
-        "momentum",
-        data.momentum || "WAIT"
-    );
-
-
-    setText(
-        "structure",
-        data.structure ||
-        "INSUFFICIENT"
-    );
-
-
-    setText(
-        "rsi",
-        data.rsi !== null &&
-        data.rsi !== undefined
-            ? Number(data.rsi).toFixed(2)
-            : "--"
-    );
-
-
-    setText(
-        "ema20",
-        data.ema20 !== null &&
-        data.ema20 !== undefined
-            ? Number(data.ema20).toFixed(3)
-            : "--"
-    );
-
-
-    setText(
-        "ema50",
-        data.ema50 !== null &&
-        data.ema50 !== undefined
-            ? Number(data.ema50).toFixed(3)
-            : "--"
-    );
-
-
-    setText(
-        "liqHigh",
-        data.liquidity_high !== null &&
-        data.liquidity_high !== undefined
-            ? Number(
-                data.liquidity_high
-              ).toFixed(3)
-            : "--"
-    );
-
-
-    setText(
-        "liqLow",
-        data.liquidity_low !== null &&
-        data.liquidity_low !== undefined
-            ? Number(
-                data.liquidity_low
-              ).toFixed(3)
-            : "--"
-    );
-
-
-    const priceStatus =
-        document.getElementById(
-            "priceStatus"
-        );
-
-    if (data.price !== null &&
-        data.price !== undefined) {
-
-        priceStatus.textContent =
-            "Live price feed active";
-
-    } else if (data.history_loaded) {
-
-        priceStatus.textContent =
-            "History loaded • waiting for live tick";
-
-    } else {
-
-        priceStatus.textContent =
-            "Waiting for live candle data...";
-    }
-
-
-    let status =
-        "Candles: " +
-        (data.candle_count || 0);
-
-
-    if (data.last_error) {
-
-        status +=
-            " • Last error: " +
-            data.last_error;
-    }
-
-    document.getElementById(
-        "status"
-    ).textContent = status;
-}
-
-
-async function loadMarket() {
+async function update() {
 
     try {
 
         const response =
             await fetch(
-                "/api/market",
+                "/api/market?t=" +
+                Date.now(),
                 {
                     cache: "no-store"
                 }
@@ -1759,27 +1617,189 @@ async function loadMarket() {
         const data =
             await response.json();
 
-        updateMarket(data);
+
+        // Connection
+        if (
+            data.connected &&
+            data.subscribed
+        ) {
+
+            text(
+                "connection",
+                "LIVE"
+            );
+
+        } else if (
+            data.connected
+        ) {
+
+            text(
+                "connection",
+                "CONNECTED"
+            );
+
+        } else {
+
+            text(
+                "connection",
+                "RECONNECTING"
+            );
+        }
+
+
+        // Price
+        if (
+            data.price !== null &&
+            data.price !== undefined
+        ) {
+
+            text(
+                "price",
+                Number(
+                    data.price
+                ).toFixed(3)
+            );
+
+            text(
+                "priceStatus",
+                "Live price feed active"
+            );
+
+        } else {
+
+            text(
+                "price",
+                "--"
+            );
+
+            text(
+                "priceStatus",
+                "Waiting for live candle data..."
+            );
+        }
+
+
+        text(
+            "signal",
+            data.signal || "WAIT"
+        );
+
+        text(
+            "strength",
+            "Strength: " +
+            (data.strength || 0) +
+            "%"
+        );
+
+        text(
+            "trend",
+            data.trend || "WAIT"
+        );
+
+        text(
+            "momentum",
+            data.momentum || "WAIT"
+        );
+
+        text(
+            "structure",
+            data.structure ||
+            "INSUFFICIENT"
+        );
+
+
+        text(
+            "rsi",
+            data.rsi === null ||
+            data.rsi === undefined
+            ? "--"
+            : Number(
+                data.rsi
+            ).toFixed(2)
+        );
+
+
+        text(
+            "ema20",
+            data.ema20 === null ||
+            data.ema20 === undefined
+            ? "--"
+            : Number(
+                data.ema20
+            ).toFixed(3)
+        );
+
+
+        text(
+            "ema50",
+            data.ema50 === null ||
+            data.ema50 === undefined
+            ? "--"
+            : Number(
+                data.ema50
+            ).toFixed(3)
+        );
+
+
+        text(
+            "liqHigh",
+            data.liquidity_high === null ||
+            data.liquidity_high === undefined
+            ? "--"
+            : Number(
+                data.liquidity_high
+            ).toFixed(3)
+        );
+
+
+        text(
+            "liqLow",
+            data.liquidity_low === null ||
+            data.liquidity_low === undefined
+            ? "--"
+            : Number(
+                data.liquidity_low
+            ).toFixed(3)
+        );
+
+
+        let status =
+            "Candles: " +
+            (data.candle_count || 0);
+
+
+        if (data.last_error) {
+
+            status +=
+                " • " +
+                data.last_error;
+        }
+
+
+        text(
+            "status",
+            status
+        );
 
     } catch (error) {
 
-        document.getElementById(
-            "connection"
-        ).textContent =
-            "API ERROR";
+        text(
+            "connection",
+            "API ERROR"
+        );
 
-        document.getElementById(
-            "status"
-        ).textContent =
-            error.toString();
+        text(
+            "status",
+            error.toString()
+        );
     }
 }
 
 
-loadMarket();
+update();
 
 setInterval(
-    loadMarket,
+    update,
     2000
 );
 
@@ -1797,29 +1817,26 @@ setInterval(
 
 @app.route("/")
 def home():
-
-    return render_template_string(
-        HTML
-    )
+    return render_template_string(HTML)
 
 
 # ============================================================
-# START BACKGROUND WORKERS
+# START ENGINE
 # ============================================================
 
-def start_workers():
+def start_engine():
 
-    global workers_started
+    global engine_started
 
-    if workers_started:
+    if engine_started:
         return
 
-    workers_started = True
+    engine_started = True
 
     log("")
-    log("======================================")
-    log("TRADING AI STARTING")
-    log("======================================")
+    log("========================================")
+    log("TRADING AI SINGLE PROCESS ENGINE")
+    log("========================================")
 
     log(
         f"API KEY PRESENT: {bool(API_KEY)}"
@@ -1829,10 +1846,7 @@ def start_workers():
         f"API KEY LENGTH: {len(API_KEY)}"
     )
 
-    # --------------------------------------------------------
-    # HISTORY THREAD
-    # --------------------------------------------------------
-
+    # History
     history_thread = threading.Thread(
         target=load_history,
         daemon=True
@@ -1840,25 +1854,17 @@ def start_workers():
 
     history_thread.start()
 
-    # --------------------------------------------------------
-    # WEBSOCKET THREAD
-    # --------------------------------------------------------
-
-    websocket_thread = threading.Thread(
+    # WebSocket
+    ws_thread = threading.Thread(
         target=websocket_loop,
         daemon=True
     )
 
-    websocket_thread.start()
+    ws_thread.start()
 
-    log("Background workers started")
-
-
-# ============================================================
-# START WORKERS AT IMPORT
-# ============================================================
-
-start_workers()
+    log(
+        "Market engine started"
+    )
 
 
 # ============================================================
@@ -1867,6 +1873,8 @@ start_workers()
 
 if __name__ == "__main__":
 
+    start_engine()
+
     port = int(
         os.environ.get(
             "PORT",
@@ -1874,8 +1882,21 @@ if __name__ == "__main__":
         )
     )
 
+    log(
+        f"HTTP server starting on port {port}"
+    )
+
     app.run(
         host="0.0.0.0",
         port=port,
-        threaded=True
+        threaded=True,
+        use_reloader=False
     )
+
+else:
+
+    # Important:
+    # Do NOT start workers during Gunicorn import.
+    # This application is intended to run directly
+    # as a single Python process.
+    pass
