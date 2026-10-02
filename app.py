@@ -58,13 +58,18 @@ clients_lock = threading.Lock()
 # =========================================================
 runtime_candles_lock = threading.RLock()
 runtime_candles = {
+    "1min": [],
     "5min": [],
     "15min": [],
     "30min": [],
     "1h": [],
     "4h": [],
+    "1day": [],
+    "1week": [],
+    "1month": [],
 }
 last_live_candle_analysis = 0.0
+last_price_broadcast = 0.0
 
 state = {
     "gold": {
@@ -88,12 +93,17 @@ state = {
         "liquidity_low": None,
 
         "sweep": "NONE",
+        "data_quality": "EARLY",
+        "candle_count": 0,
+        "signal_ready": False,
+        "market_phase": {"phase": "INITIALIZING", "duration": "Waiting for genuine market candles."},
 
         "signal": "WAIT",
         "confidence": 50,
         "score": 0,
 
         "connection": "CONNECTING",
+        "data_source": "Twelve Data WebSocket / REST history",
 
         "updated": None,
 
@@ -201,12 +211,7 @@ def broadcast():
 
 
 def update_live_candles(price):
-    """Build 5m OHLC candles from the live WebSocket price stream.
-
-    This is the quota-protection layer: once the WebSocket is connected,
-    new candles do not require another Twelve Data REST request. Higher
-    timeframes are derived locally from the 5m stream.
-    """
+    """Build genuine OHLC candles from WebSocket ticks without REST calls."""
     global last_live_candle_analysis
 
     price = number(price)
@@ -214,38 +219,55 @@ def update_live_candles(price):
         return
 
     ts = int(time.time())
-    bucket = (ts // 300) * 300
 
     with runtime_candles_lock:
-        rows = runtime_candles.setdefault("5min", [])
-        current = rows[-1] if rows else None
-        current_ts = candle_time(current) if current else None
+        # 1-minute live candle stream for the finest local chart.
+        rows_1m = runtime_candles.setdefault("1min", [])
+        bucket_1m = (ts // 60) * 60
+        current_1m = rows_1m[-1] if rows_1m else None
+        current_1m_ts = candle_time(current_1m) if current_1m else None
 
-        if current is None or current_ts != bucket:
-            rows.append({
-                "datetime": datetime.fromtimestamp(bucket, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
+        if current_1m is None or current_1m_ts != bucket_1m:
+            rows_1m.append({
+                "datetime": datetime.fromtimestamp(bucket_1m, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "open": price, "high": price, "low": price, "close": price,
             })
         else:
-            current["high"] = max(float(current["high"]), price)
-            current["low"] = min(float(current["low"]), price)
-            current["close"] = price
+            current_1m["high"] = max(float(current_1m["high"]), price)
+            current_1m["low"] = min(float(current_1m["low"]), price)
+            current_1m["close"] = price
+        runtime_candles["1min"] = rows_1m[-5000:]
 
-        # Keep enough local history for EMA50 and structure calculations.
-        runtime_candles["5min"] = rows[-600:]
+        # 5-minute stream is the canonical historical/live base. This is
+        # deliberately updated independently so a large REST seed is never
+        # destroyed by the shorter live 1-minute buffer.
+        rows_5m = runtime_candles.setdefault("5min", [])
+        bucket_5m = (ts // 300) * 300
+        current_5m = rows_5m[-1] if rows_5m else None
+        current_5m_ts = candle_time(current_5m) if current_5m else None
+
+        if current_5m is None or current_5m_ts != bucket_5m:
+            rows_5m.append({
+                "datetime": datetime.fromtimestamp(bucket_5m, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "open": price, "high": price, "low": price, "close": price,
+            })
+        else:
+            current_5m["high"] = max(float(current_5m["high"]), price)
+            current_5m["low"] = min(float(current_5m["low"]), price)
+            current_5m["close"] = price
+        runtime_candles["5min"] = rows_5m[-5000:]
+
         base = runtime_candles["5min"]
-        runtime_candles["15min"] = resample_candles(base, 15 * 60)[-400:]
-        runtime_candles["30min"] = resample_candles(base, 30 * 60)[-300:]
-        runtime_candles["1h"] = resample_candles(base, 60 * 60)[-250:]
-        runtime_candles["4h"] = resample_candles(base, 4 * 60 * 60)[-180:]
+        runtime_candles["15min"] = resample_candles(base, 15 * 60)[-1000:]
+        runtime_candles["30min"] = resample_candles(base, 30 * 60)[-700:]
+        runtime_candles["1h"] = resample_candles(base, 60 * 60)[-500:]
+        runtime_candles["4h"] = resample_candles(base, 4 * 60 * 60)[-250:]
+        runtime_candles["1day"] = resample_candles(base, 24 * 60 * 60)[-120:]
+        runtime_candles["1week"] = resample_candles(base, 7 * 24 * 60 * 60)[-80:]
+        runtime_candles["1month"] = resample_candles(base, 30 * 24 * 60 * 60)[-60:]
 
-        snapshot = {k: list(v) for k, v in runtime_candles.items()}
+        snapshot = {k: list(v) for k, v in runtime_candles.items() if v}
 
-    # Do not run indicators on every WebSocket tick. Ten seconds is enough
-    # for live dashboard updates while keeping CPU/broadcast load low.
     now = time.time()
     if now - last_live_candle_analysis >= 10:
         last_live_candle_analysis = now
@@ -253,8 +275,9 @@ def update_live_candles(price):
 
 
 def update_gold_price(price):
-    price = number(price)
+    global last_price_broadcast
 
+    price = number(price)
     if price is None:
         return
 
@@ -262,16 +285,19 @@ def update_gold_price(price):
         state["gold"]["price"] = price
         state["gold"]["updated"] = now_text()
         state["gold"]["connection"] = "CONNECTED"
+        state["gold"]["data_source"] = "Twelve Data WebSocket"
         state["gold"]["error"] = None
 
-    # Feed the live WebSocket price into the local candle engine.
     update_live_candles(price)
 
-    broadcast()
+    # Price ticks can arrive much faster than the browser needs.
+    # One UI update per second keeps the stream stable without losing market data.
+    now = time.time()
+    if now - last_price_broadcast >= 1.0:
+        last_price_broadcast = now
+        broadcast()
 
-    print(
-        f"STATE UPDATED: GOLD = {price}"
-    )
+    print(f"STATE UPDATED: GOLD = {price}", flush=True)
 
 
 # =========================================================
@@ -408,6 +434,21 @@ def get_candles(symbol, interval, outputsize=200):
     rows = list(reversed(values))
     rest_last_success = now_text()
     rest_last_error = None
+
+    # Keep the successful seed in memory. A temporary 429/network failure must
+    # never erase the last known-good historical dataset.
+    with runtime_candles_lock:
+        if interval == "5min":
+            runtime_candles["5min"] = rows[-5000:]
+            base = runtime_candles["5min"]
+            runtime_candles["15min"] = resample_candles(base, 15 * 60)[-1000:]
+            runtime_candles["30min"] = resample_candles(base, 30 * 60)[-700:]
+            runtime_candles["1h"] = resample_candles(base, 60 * 60)[-500:]
+            runtime_candles["4h"] = resample_candles(base, 4 * 60 * 60)[-180:]
+            runtime_candles["1day"] = resample_candles(base, 24 * 60 * 60)[-120:]
+            runtime_candles["1week"] = resample_candles(base, 7 * 24 * 60 * 60)[-80:]
+            runtime_candles["1month"] = resample_candles(base, 30 * 24 * 60 * 60)[-60:]
+
     print(f"CANDLE PARSED: {interval} candles={len(rows)}", flush=True)
     return rows
 
@@ -463,6 +504,14 @@ def set_error(message):
 
 
 def analyze_timeframe(candles):
+    """Progressive analysis from genuine candles only.
+
+    The old version returned {} until 20 candles existed, which made the
+    whole dashboard look like WAITING after a restart when REST history was
+    unavailable. This version publishes the parts that are genuinely
+    calculable from the candles already available. Missing indicators stay
+    None instead of being fabricated.
+    """
     if not candles:
         return {}
 
@@ -480,20 +529,28 @@ def analyze_timeframe(candles):
         if low is not None:
             lows.append(low)
 
-    if len(closes) < 20:
+    # A candle set with fewer than 3 closes cannot support even the basic
+    # structure/sweep/pivot calculations reliably.
+    if len(closes) < 3 or len(highs) < 3 or len(lows) < 3:
         return {}
 
     current = closes[-1]
+
+    # These indicators are deliberately calculated only when their genuine
+    # minimum history exists. No synthetic/fake values are used.
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
     current_rsi = rsi(closes, 14)
 
-    recent_highs = highs[-20:]
-    recent_lows = lows[-20:]
+    lookback = min(20, len(closes))
+    recent_highs = highs[-lookback:]
+    recent_lows = lows[-lookback:]
 
     support = min(recent_lows) if recent_lows else None
     resistance = max(recent_highs) if recent_highs else None
 
+    # Trend quality: FULL means EMA20+EMA50; EMA20 means a usable but
+    # incomplete trend; EARLY is intentionally neutral to avoid false signals.
     if ema20 is not None and ema50 is not None:
         if current > ema20 > ema50:
             trend = "BULLISH"
@@ -501,8 +558,18 @@ def analyze_timeframe(candles):
             trend = "BEARISH"
         else:
             trend = "NEUTRAL"
+        trend_quality = "FULL"
+    elif ema20 is not None:
+        if current > ema20:
+            trend = "BULLISH"
+        elif current < ema20:
+            trend = "BEARISH"
+        else:
+            trend = "NEUTRAL"
+        trend_quality = "EMA20_READY"
     else:
         trend = "NEUTRAL"
+        trend_quality = "EARLY"
 
     if current_rsi is None:
         momentum = "NEUTRAL"
@@ -513,10 +580,12 @@ def analyze_timeframe(candles):
     else:
         momentum = "NEUTRAL"
 
-    recent = closes[-10:]
-    if len(recent) >= 10:
-        old_average = sum(recent[:5]) / 5
-        new_average = sum(recent[-5:]) / 5
+    structure_lookback = min(10, len(closes))
+    recent = closes[-structure_lookback:]
+    if len(recent) >= 4:
+        half = max(2, len(recent) // 2)
+        old_average = sum(recent[:half]) / half
+        new_average = sum(recent[-half:]) / half
         if new_average > old_average:
             structure = "HIGHER"
         elif new_average < old_average:
@@ -527,8 +596,9 @@ def analyze_timeframe(candles):
         structure = "RANGE"
 
     # Liquidity: recent extremes that can act as buy-side/sell-side pools.
-    liquidity_high = max(highs[-10:]) if len(highs) >= 10 else resistance
-    liquidity_low = min(lows[-10:]) if len(lows) >= 10 else support
+    liquidity_lookback = min(10, len(highs))
+    liquidity_high = max(highs[-liquidity_lookback:])
+    liquidity_low = min(lows[-liquidity_lookback:])
 
     sweep = "NONE"
     if len(candles) >= 3:
@@ -544,7 +614,6 @@ def analyze_timeframe(candles):
             sweep = "LOW SWEEP"
 
     # Classic floor-trader pivot from the most recently completed candle.
-    # Using the prior candle prevents the current candle from moving its own pivot.
     pivot = r1 = r2 = r3 = s1 = s2 = s3 = None
     if len(highs) >= 2 and len(lows) >= 2 and len(closes) >= 2:
         prev_high = highs[-2]
@@ -567,9 +636,21 @@ def analyze_timeframe(candles):
     else:
         pivot_bias = "AT PIVOT"
 
+    if len(closes) >= 50:
+        data_quality = "FULL"
+    elif len(closes) >= 20:
+        data_quality = "EMA20_READY"
+    elif len(closes) >= 14:
+        data_quality = "RSI_READY"
+    else:
+        data_quality = "EARLY"
+
     return {
         "price": current,
         "trend": trend,
+        "trend_quality": trend_quality,
+        "data_quality": data_quality,
+        "candle_count": len(closes),
         "momentum": momentum,
         "structure": structure,
         "rsi": round(current_rsi, 2) if current_rsi is not None else None,
@@ -597,7 +678,13 @@ def analyze_timeframe(candles):
 
 
 def build_ai_analysis(timeframes, live_price):
-    """Explainable scoring engine: trend + structure + liquidity + pivot + MTF conflict filter."""
+    """Explainable score with a data-quality gate.
+
+    Partial candles can populate the dashboard, but a directional AI signal
+    is allowed only when the 5m and 15m timeframes have at least EMA20-quality
+    history. This keeps the UI alive without turning a fresh/restarted process
+    into a false-signal generator.
+    """
     score = 0
     reasons = []
     five = timeframes.get("5min", {})
@@ -611,71 +698,88 @@ def build_ai_analysis(timeframes, live_price):
             score += points
             reasons.append(reason)
 
-    # Existing technical layers.
-    add(five.get("trend") == "BULLISH", 2, "5m trend bullish")
-    add(five.get("trend") == "BEARISH", -2, "5m trend bearish")
-    add(five.get("momentum") == "BUYING", 1, "5m momentum buying")
-    add(five.get("momentum") == "SELLING", -1, "5m momentum selling")
-    add(fifteen.get("trend") == "BULLISH", 2, "15m trend bullish")
-    add(fifteen.get("trend") == "BEARISH", -2, "15m trend bearish")
-    add(fifteen.get("structure") == "HIGHER", 1, "15m structure higher")
-    add(fifteen.get("structure") == "LOWER", -1, "15m structure lower")
-    add(one_hour.get("trend") == "BULLISH", 2, "1H trend bullish")
-    add(one_hour.get("trend") == "BEARISH", -2, "1H trend bearish")
-    add(four_hour.get("trend") == "BULLISH", 1, "4H trend bullish")
-    add(four_hour.get("trend") == "BEARISH", -1, "4H trend bearish")
+    five_ready = five.get("ema20") is not None
+    fifteen_ready = fifteen.get("ema20") is not None
+    signal_ready = five_ready and fifteen_ready
 
-    # Liquidity sweep: a low sweep can support a bullish reversal; a high sweep can support bearish rejection.
+    # Trend/momentum scoring is only enabled when the relevant timeframe has
+    # enough genuine history. Structure/liquidity/pivot remain visible earlier.
+    if five_ready:
+        add(five.get("trend") == "BULLISH", 2, "5m trend bullish")
+        add(five.get("trend") == "BEARISH", -2, "5m trend bearish")
+        add(five.get("momentum") == "BUYING", 1, "5m momentum buying")
+        add(five.get("momentum") == "SELLING", -1, "5m momentum selling")
+
+    if fifteen_ready:
+        add(fifteen.get("trend") == "BULLISH", 2, "15m trend bullish")
+        add(fifteen.get("trend") == "BEARISH", -2, "15m trend bearish")
+        add(fifteen.get("structure") == "HIGHER", 1, "15m structure higher")
+        add(fifteen.get("structure") == "LOWER", -1, "15m structure lower")
+
+    if one_hour.get("ema20") is not None:
+        add(one_hour.get("trend") == "BULLISH", 2, "1H trend bullish")
+        add(one_hour.get("trend") == "BEARISH", -2, "1H trend bearish")
+
+    if four_hour.get("ema20") is not None:
+        add(four_hour.get("trend") == "BULLISH", 1, "4H trend bullish")
+        add(four_hour.get("trend") == "BEARISH", -1, "4H trend bearish")
+
     sweep = five.get("sweep", "NONE")
     add(sweep == "LOW SWEEP", 1, "5m low-liquidity sweep")
     add(sweep == "HIGH SWEEP", -1, "5m high-liquidity sweep")
 
-    # Pivot bias is a filter/confluence layer, not a standalone trigger.
     pivot_bias = five.get("pivot_bias")
-    add(pivot_bias == "ABOVE PIVOT" and five.get("trend") == "BULLISH", 1, "5m above pivot with bullish trend")
-    add(pivot_bias == "BELOW PIVOT" and five.get("trend") == "BEARISH", -1, "5m below pivot with bearish trend")
+    add(pivot_bias == "ABOVE PIVOT" and five.get("trend") == "BULLISH" and five_ready,
+        1, "5m above pivot with bullish trend")
+    add(pivot_bias == "BELOW PIVOT" and five.get("trend") == "BEARISH" and five_ready,
+        -1, "5m below pivot with bearish trend")
 
-    # Higher-timeframe pivot alignment.
-    add(one_hour.get("pivot_bias") == "ABOVE PIVOT" and one_hour.get("trend") == "BULLISH",
-        1, "1H above pivot with bullish trend")
-    add(one_hour.get("pivot_bias") == "BELOW PIVOT" and one_hour.get("trend") == "BEARISH",
-        -1, "1H below pivot with bearish trend")
+    add(one_hour.get("pivot_bias") == "ABOVE PIVOT" and one_hour.get("trend") == "BULLISH"
+        and one_hour.get("ema20") is not None, 1, "1H above pivot with bullish trend")
+    add(one_hour.get("pivot_bias") == "BELOW PIVOT" and one_hour.get("trend") == "BEARISH"
+        and one_hour.get("ema20") is not None, -1, "1H below pivot with bearish trend")
 
-    # Multi-timeframe conflict: do not let a short-term signal become overconfident
-    # when the 1H/4H direction strongly disagrees.
-    bullish_htf = sum(x.get("trend") == "BULLISH" for x in (one_hour, four_hour))
-    bearish_htf = sum(x.get("trend") == "BEARISH" for x in (one_hour, four_hour))
-    short_term_bull = five.get("trend") == "BULLISH" and fifteen.get("trend") == "BULLISH"
-    short_term_bear = five.get("trend") == "BEARISH" and fifteen.get("trend") == "BEARISH"
+    bullish_htf = sum(x.get("trend") == "BULLISH" and x.get("ema20") is not None
+                      for x in (one_hour, four_hour))
+    bearish_htf = sum(x.get("trend") == "BEARISH" and x.get("ema20") is not None
+                      for x in (one_hour, four_hour))
+    short_term_bull = five_ready and fifteen_ready and five.get("trend") == "BULLISH" and fifteen.get("trend") == "BULLISH"
+    short_term_bear = five_ready and fifteen_ready and five.get("trend") == "BEARISH" and fifteen.get("trend") == "BEARISH"
 
     conflict = False
-    if short_term_bull and bearish_htf == 2:
-        score -= 2
-        reasons.append("MTF conflict: 5m/15m bullish vs 1H/4H bearish")
+    if short_term_bull and bullish_htf == 0 and (one_hour.get("ema20") is not None or four_hour.get("ema20") is not None):
+        score -= 1
+        reasons.append("HTF caution: higher-timeframe trend is not bullish")
         conflict = True
-    elif short_term_bear and bullish_htf == 2:
-        score += 2
-        reasons.append("MTF conflict: 5m/15m bearish vs 1H/4H bullish")
+    elif short_term_bear and bearish_htf == 0 and (one_hour.get("ema20") is not None or four_hour.get("ema20") is not None):
+        score += 1
+        reasons.append("HTF caution: higher-timeframe trend is not bearish")
         conflict = True
 
     score = max(-10, min(10, score))
 
-    # Strong conflict prevents a forced directional conclusion at the threshold.
-    if conflict and abs(score) < 8:
+    # Until both 5m and 15m have EMA20 history, the engine stays WAIT.
+    # This is the important protection that separates dashboard readiness from
+    # trade-signal readiness.
+    if not signal_ready:
         decision = "WAIT"
+        reasons.insert(0, "Signal waiting for genuine 5m + 15m EMA20 history")
+        confidence = 50
+    elif conflict and abs(score) < 8:
+        decision = "WAIT"
+        confidence = min(65, max(50, 50 + abs(score) * 5))
     else:
         decision = "BUY" if score >= 6 else "SELL" if score <= -6 else "WAIT"
-
-    confidence = max(50, min(95, 50 + abs(score) * 5))
-    if conflict:
-        confidence = min(confidence, 65)
+        confidence = max(50, min(95, 50 + abs(score) * 5))
 
     return {
         "signal": decision,
         "confidence": confidence,
-        "score": score,
+        "score": score if signal_ready else 0,
+        "raw_score": score,
         "reasons": reasons,
         "mtf_conflict": conflict,
+        "signal_ready": signal_ready,
     }
 
 
@@ -729,66 +833,52 @@ def record_signal_history(ai, live_price):
 # =========================================================
 
 def gold_analysis_loop():
-    """Quota-safe candle engine. REST is used only as an optional history seed.
+    """Quota-safe production candle engine.
 
-    After the initial seed, all new 5m/15m/30m/1h/4h candles come from the
-    existing Gold WebSocket price stream. This prevents the dashboard from
-    consuming hundreds of REST credits every day.
+    Startup performs at most one 5-minute historical request. Twelve Data
+    documents /time_series at 1 API credit per symbol and up to 5,000 points;
+    we therefore use one large seed instead of repeatedly querying every
+    timeframe. After startup, higher timeframes are derived locally and live
+    candles are built from the authorized WebSocket feed.
     """
     print("CANDLE ENGINE STARTED", flush=True)
-    print("CANDLE ENGINE MODE: WS LIVE + OPTIONAL REST HISTORY SEED", flush=True)
+    print("CANDLE ENGINE MODE: ONE REST 5m SEED + LOCAL MTF + LIVE WS", flush=True)
 
-    specs = {
-        "5min": ("5min", 300),
-        "15min": ("15min", 250),
-        "1h": ("1h", 200),
-        "4h": ("4h", 150),
-    }
+    try:
+        print("CANDLE ENGINE: requesting one 5min history seed", flush=True)
+        rows = get_candles(GOLD_SYMBOL, "5min", 5000)
+        if rows:
+            with runtime_candles_lock:
+                runtime_candles["5min"] = rows[-5000:]
+                base = runtime_candles["5min"]
+                runtime_candles["15min"] = resample_candles(base, 15 * 60)[-1000:]
+                runtime_candles["30min"] = resample_candles(base, 30 * 60)[-700:]
+                runtime_candles["1h"] = resample_candles(base, 60 * 60)[-500:]
+                runtime_candles["4h"] = resample_candles(base, 4 * 60 * 60)[-180:]
+                runtime_candles["1day"] = resample_candles(base, 24 * 60 * 60)[-120:]
+                runtime_candles["1week"] = resample_candles(base, 7 * 24 * 60 * 60)[-80:]
+                runtime_candles["1month"] = resample_candles(base, 30 * 24 * 60 * 60)[-60:]
+            print(f"CANDLE ENGINE: 5m HISTORY READY ({len(rows)})", flush=True)
+    except Exception as exc:
+        print(f"CANDLE ENGINE: REST HISTORY SKIPPED: {exc}", flush=True)
 
-    # REST is attempted only once per process for historical bootstrap.
-    # If the account is over quota, the WebSocket candle builder takes over.
-    for key, (interval, outputsize) in specs.items():
-        try:
-            print(f"CANDLE ENGINE: history seed {key}", flush=True)
-            rows = get_candles(GOLD_SYMBOL, interval, outputsize)
-            if rows:
-                with runtime_candles_lock:
-                    runtime_candles[key] = rows[-600:]
-                print(f"CANDLE ENGINE: {key} HISTORY READY ({len(rows)})", flush=True)
-        except Exception as exc:
-            print(f"CANDLE ENGINE: {key} HISTORY SKIPPED: {exc}", flush=True)
-        time.sleep(2)
-
-    # Build higher timeframes from the best available 5m history. If direct
-    # REST history exists it is retained until the live builder supplies new data.
     with runtime_candles_lock:
-        if runtime_candles["5min"]:
-            base = runtime_candles["5min"]
-            runtime_candles["15min"] = resample_candles(base, 15 * 60)[-400:]
-            runtime_candles["30min"] = resample_candles(base, 30 * 60)[-300:]
-            runtime_candles["1h"] = resample_candles(base, 60 * 60)[-250:]
-            runtime_candles["4h"] = resample_candles(base, 4 * 60 * 60)[-180:]
         snapshot = {k: list(v) for k, v in runtime_candles.items() if v}
 
     if snapshot:
         rebuild_analysis_from_cache(snapshot)
     else:
-        print("CANDLE ENGINE: no REST history; waiting for WebSocket candles", flush=True)
+        print("CANDLE ENGINE: no historical seed; waiting for genuine WebSocket candles", flush=True)
 
     while True:
         try:
-            # Live candles are maintained by update_live_candles().
-            # This loop only keeps analysis alive and never makes REST calls.
             with runtime_candles_lock:
                 snapshot = {k: list(v) for k, v in runtime_candles.items() if v}
             if snapshot:
                 rebuild_analysis_from_cache(snapshot)
-            else:
-                print("AI UPDATE: no candle data yet; WebSocket price remains live", flush=True)
         except Exception as exc:
             print("CANDLE ENGINE LOOP ERROR:", repr(exc), flush=True)
         time.sleep(15)
-
 
 
 def rebuild_analysis_from_cache(cached):
@@ -822,6 +912,7 @@ def rebuild_analysis_from_cache(cached):
 
     ai = build_ai_analysis(timeframe_data, live_price)
     trade_plan = build_trade_plan(timeframe_data, live_price, ai)
+    phase = build_market_phase(timeframe_data, ai)
     five = timeframe_data.get("5min", {})
 
     record_signal_history(ai, live_price)
@@ -835,6 +926,7 @@ def rebuild_analysis_from_cache(cached):
             k: v.get("candles", []) for k, v in existing_tf.items()
         }
         state["gold"]["trade_plan"] = trade_plan
+        state["gold"]["market_phase"] = phase
         state["gold"].update({
             "trend": five.get("trend", state["gold"].get("trend", "WAITING")),
             "momentum": five.get("momentum", state["gold"].get("momentum", "WAITING")),
@@ -847,6 +939,10 @@ def rebuild_analysis_from_cache(cached):
             "liquidity_high": five.get("liquidity_high", state["gold"].get("liquidity_high")),
             "liquidity_low": five.get("liquidity_low", state["gold"].get("liquidity_low")),
             "sweep": five.get("sweep", state["gold"].get("sweep", "NONE")),
+            "data_quality": five.get("data_quality", state["gold"].get("data_quality", "EARLY")),
+            "candle_count": five.get("candle_count", state["gold"].get("candle_count", 0)),
+            "signal_ready": ai.get("signal_ready", False),
+            "data_source": "Twelve Data WebSocket / REST history",
             "signal": ai["signal"],
             "confidence": ai["confidence"],
             "score": ai["score"],
@@ -1097,6 +1193,26 @@ def home():
 # API
 # =========================================================
 
+@app.route("/api/state")
+def api_state():
+    """Backward-compatible state endpoint used by older dashboard builds."""
+    start_workers()
+    with lock:
+        data = json.loads(json.dumps(state))
+    return jsonify(data)
+
+
+@app.route("/api/candles/<interval>")
+def api_candles(interval):
+    """Backward-compatible candle endpoint; never calls Twelve Data."""
+    allowed = {"1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week", "1month"}
+    if interval not in allowed:
+        return jsonify({"status": "error", "message": "Unsupported interval"}), 400
+    with runtime_candles_lock:
+        rows = list(runtime_candles.get(interval, []))
+    return jsonify({"status": "ok", "symbol": GOLD_SYMBOL, "interval": interval, "values": rows[-500:]})
+
+
 @app.route("/api/market")
 def api_market():
 
@@ -1219,7 +1335,9 @@ def health():
         "api_credits_left": rest_api_credits_left,
         "api_credits_used": rest_api_credits_used,
         "live_candle_source": "Twelve Data WebSocket",
+        "live_1min_candles": len(runtime_candles.get("1min", [])),
         "live_5min_candles": len(runtime_candles.get("5min", [])),
+        "signal_ready": state["gold"].get("signal_ready", False),
         "time": now_text()
     })
 
