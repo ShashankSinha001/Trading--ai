@@ -13,7 +13,16 @@ app = Flask(__name__)
 # TRADING AI
 # REAL-TIME MARKET INTELLIGENCE
 # GOLD XAU/USD
-# STABLE / CACHE-SAFE VERSION
+#
+# STABLE MASTER VERSION
+# Dashboard/UI intentionally preserved.
+# Backend optimized for:
+# - WebSocket-first live price
+# - Per-timeframe candle cache
+# - Per-timeframe 429 protection
+# - No cache wiping on API errors
+# - Compatible /api/market + /api/state
+# - Reduced Twelve Data API usage
 # ============================================================
 
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
@@ -29,7 +38,6 @@ REST_TIME_SERIES_URL = "https://api.twelvedata.com/time_series"
 
 WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
 
-
 # ============================================================
 # TIMEFRAMES
 # ============================================================
@@ -43,39 +51,31 @@ CANDLE_INTERVALS = [
     "1day"
 ]
 
-# These are minimum cache lifetimes.
+# Minimum time between REST requests.
 #
-# Important:
-# We intentionally do NOT continuously hammer Twelve Data.
+# IMPORTANT:
+# These are deliberately conservative because the API plan
+# has limited credits.
 #
+# 5m/15m/1h/4h are the CORE analysis timeframes.
+# 1m/1D are refreshed much less frequently.
+# ============================================================
+
 FETCH_INTERVALS = {
-    "1min": 600,       # 10 min
-    "5min": 180,       # 3 min
-    "15min": 300,      # 5 min
-    "1h": 900,         # 15 min
-    "4h": 1800,        # 30 min
+    "1min": 900,       # 15 minutes
+    "5min": 300,       # 5 minutes
+    "15min": 600,      # 10 minutes
+    "1h": 1800,        # 30 minutes
+    "4h": 3600,        # 60 minutes
     "1day": 21600      # 6 hours
 }
 
-
-# ============================================================
-# ANALYSIS PRIORITY
-# ============================================================
-
-# These timeframes are required by the AI engine.
-CORE_ANALYSIS_INTERVALS = [
+CORE_INTERVALS = [
     "5min",
     "15min",
     "1h",
     "4h"
 ]
-
-# Chart-only timeframes.
-CHART_ONLY_INTERVALS = [
-    "1min",
-    "1day"
-]
-
 
 # ============================================================
 # CACHE
@@ -91,43 +91,25 @@ price_cache = {
 
 price_cache_lock = threading.RLock()
 
-
-# ============================================================
-# PER-RESOURCE BACKOFF
-# ============================================================
+# ------------------------------------------------------------
+# Per-resource backoff.
 #
-# IMPORTANT:
-# Do NOT use one global API backoff for every endpoint.
+# OLD PROBLEM:
+# One 429 stopped ALL candle requests.
 #
-# If 5m receives a 429, 15m/1h/4h should not automatically
-# become unavailable.
-#
-
-price_backoff_until = 0
+# NEW:
+# Each timeframe has its own backoff.
+# ------------------------------------------------------------
 
 candle_backoff_until = {
     interval: 0
     for interval in CANDLE_INTERVALS
 }
 
+candle_backoff_lock = threading.RLock()
+
+price_backoff_until = 0
 price_backoff_lock = threading.Lock()
-candle_backoff_lock = threading.Lock()
-
-
-# ============================================================
-# REQUEST LOCKS
-# ============================================================
-#
-# Prevent duplicate requests for the same timeframe.
-#
-
-candle_request_locks = {
-    interval: threading.Lock()
-    for interval in CANDLE_INTERVALS
-}
-
-price_request_lock = threading.Lock()
-
 
 # ============================================================
 # GLOBAL STATE
@@ -140,6 +122,9 @@ workers_started = False
 clients = []
 clients_lock = threading.Lock()
 
+# WebSocket status tracking.
+ws_last_price_time = 0
+ws_status_lock = threading.RLock()
 
 state = {
     "gold": {
@@ -176,11 +161,6 @@ state = {
 
         "signal_history": [],
 
-        "market_phase": {
-            "phase": "MARKET PHASE",
-            "duration": "Waiting for market data."
-        },
-
         "trade_plan": {
             "signal": "WAIT",
             "entry": None,
@@ -191,6 +171,11 @@ state = {
             "risk_reward": None,
             "invalidation": None,
             "reason": []
+        },
+
+        "market_phase": {
+            "phase": "TRANSITION / RANGE",
+            "duration": "Waiting for market data."
         },
 
         "error": None,
@@ -247,33 +232,29 @@ def now_text():
 
 def number(value):
     try:
-        if value is None:
-            return None
-
         return float(value)
-
     except Exception:
         return None
 
 
-def safe_json(data):
-    return json.loads(
-        json.dumps(
-            data,
-            default=str
+def safe_copy_state():
+    with lock:
+        return json.loads(
+            json.dumps(
+                state,
+                separators=(",", ":")
+            )
         )
-    )
 
 
 def broadcast():
 
-    with lock:
+    payload = safe_copy_state()
 
-        payload = json.dumps(
-            state,
-            separators=(",", ":"),
-            default=str
-        )
+    payload_text = json.dumps(
+        payload,
+        separators=(",", ":")
+    )
 
     dead = []
 
@@ -283,7 +264,9 @@ def broadcast():
 
             try:
 
-                q.put_nowait(payload)
+                q.put_nowait(
+                    payload_text
+                )
 
             except Exception:
 
@@ -294,16 +277,16 @@ def broadcast():
             try:
 
                 clients.remove(q)
-
             except ValueError:
-
                 pass
 
 
 def set_gold_price(
     price,
-    source="Twelve Data WebSocket"
+    source="Twelve Data REST"
 ):
+
+    global ws_last_price_time
 
     price = number(price)
 
@@ -320,11 +303,14 @@ def set_gold_price(
 
         state["gold"]["data_source"] = source
 
-        # Do not erase existing analytical state here.
-        #
-        # This is important because live price can continue
-        # arriving even when historical candle API is temporarily
-        # unavailable.
+        # A successful live price means old transient
+        # connection errors should not remain on screen.
+        state["gold"]["error"] = None
+
+    if source == "Twelve Data WebSocket":
+
+        with ws_status_lock:
+            ws_last_price_time = time.time()
 
     broadcast()
 
@@ -340,14 +326,16 @@ def ema(values, period):
 
     multiplier = 2.0 / (period + 1.0)
 
-    result = sum(
-        values[:period]
-    ) / period
+    result = (
+        sum(values[:period])
+        / period
+    )
 
     for value in values[period:]:
 
         result = (
-            (value - result) * multiplier
+            (value - result)
+            * multiplier
         ) + result
 
     return result
@@ -355,7 +343,7 @@ def ema(values, period):
 
 def rsi(values, period=14):
 
-    if not values or len(values) < period + 1:
+    if len(values) < period + 1:
         return None
 
     gains = []
@@ -364,8 +352,8 @@ def rsi(values, period=14):
     for i in range(1, len(values)):
 
         change = (
-            values[i] -
-            values[i - 1]
+            values[i]
+            - values[i - 1]
         )
 
         if change >= 0:
@@ -379,13 +367,13 @@ def rsi(values, period=14):
             losses.append(abs(change))
 
     avg_gain = (
-        sum(gains[:period]) /
-        period
+        sum(gains[:period])
+        / period
     )
 
     avg_loss = (
-        sum(losses[:period]) /
-        period
+        sum(losses[:period])
+        / period
     )
 
     for i in range(
@@ -395,46 +383,235 @@ def rsi(values, period=14):
 
         avg_gain = (
             (
-                avg_gain * (period - 1)
+                avg_gain
+                * (period - 1)
             )
-            +
-            gains[i]
+            + gains[i]
         ) / period
 
         avg_loss = (
             (
-                avg_loss * (period - 1)
+                avg_loss
+                * (period - 1)
             )
-            +
-            losses[i]
+            + losses[i]
         ) / period
 
     if avg_loss == 0:
-
         return 100.0
 
     rs = avg_gain / avg_loss
 
     return 100.0 - (
-        100.0 /
-        (1.0 + rs)
+        100.0 / (1.0 + rs)
     )
 
 
 # ============================================================
-# CANDLE NORMALIZATION
+# PRICE CACHE
 # ============================================================
+
+def get_cached_price():
+
+    with price_cache_lock:
+
+        return price_cache.get(
+            "price"
+        )
+
+
+# ============================================================
+# REST PRICE FALLBACK
+# ============================================================
+
+def get_live_price():
+
+    global price_backoff_until
+
+    if not API_KEY:
+
+        print(
+            "ERROR: TWELVE_DATA_API_KEY missing"
+        )
+
+        return None
+
+    now = time.time()
+
+    with price_backoff_lock:
+
+        if now < price_backoff_until:
+
+            return get_cached_price()
+
+    # --------------------------------------------------------
+    # If WebSocket has supplied a price recently, DO NOT spend
+    # another REST API credit.
+    # --------------------------------------------------------
+
+    with ws_status_lock:
+
+        ws_age = (
+            time.time()
+            - ws_last_price_time
+        )
+
+    if ws_age < 90:
+
+        cached = get_cached_price()
+
+        if cached is not None:
+            return cached
+
+    # --------------------------------------------------------
+    # Price cache.
+    # --------------------------------------------------------
+
+    with price_cache_lock:
+
+        cached_price = price_cache.get(
+            "price"
+        )
+
+        cached_time = price_cache.get(
+            "timestamp",
+            0
+        )
+
+    if (
+        cached_price is not None
+        and
+        now - cached_time < 60
+    ):
+
+        return cached_price
+
+    try:
+
+        response = requests.get(
+            REST_PRICE_URL,
+            params={
+                "symbol": GOLD_SYMBOL,
+                "apikey": API_KEY
+            },
+            timeout=15
+        )
+
+        if response.status_code == 429:
+
+            print(
+                "PRICE 429 - preserving price cache"
+            )
+
+            with price_backoff_lock:
+
+                # Longer than before to avoid repeatedly
+                # hitting an already limited endpoint.
+                price_backoff_until = (
+                    time.time() + 300
+                )
+
+            return get_cached_price()
+
+        if response.status_code != 200:
+
+            print(
+                "PRICE HTTP ERROR:",
+                response.status_code
+            )
+
+            return get_cached_price()
+
+        data = response.json()
+
+        if data.get("status") == "error":
+
+            message = data.get(
+                "message",
+                ""
+            )
+
+            print(
+                "PRICE API ERROR:",
+                message
+            )
+
+            return get_cached_price()
+
+        price = number(
+            data.get("price")
+        )
+
+        if price is None:
+
+            return get_cached_price()
+
+        with price_cache_lock:
+
+            price_cache["price"] = price
+            price_cache["timestamp"] = (
+                time.time()
+            )
+
+        return price
+
+    except Exception as exc:
+
+        print(
+            "PRICE ERROR:",
+            repr(exc)
+        )
+
+        return get_cached_price()
+
+
+# ============================================================
+# CANDLE HELPERS
+# ============================================================
+
+def get_cached_candles(
+    symbol,
+    interval
+):
+
+    cache_key = (
+        f"{symbol}:{interval}"
+    )
+
+    with candle_cache_lock:
+
+        cached = candle_cache.get(
+            cache_key
+        )
+
+        if not cached:
+            return []
+
+        return list(
+            cached.get(
+                "values",
+                []
+            )
+        )
+
 
 def normalize_candles(values):
 
-    if not isinstance(values, list):
+    if not isinstance(
+        values,
+        list
+    ):
+
         return []
 
-    clean = []
+    normalized = []
 
     for candle in values:
 
-        if not isinstance(candle, dict):
+        if not isinstance(
+            candle,
+            dict
+        ):
             continue
 
         dt = (
@@ -473,7 +650,7 @@ def normalize_candles(values):
         ):
             continue
 
-        clean.append({
+        normalized.append({
 
             "datetime": str(dt),
 
@@ -488,386 +665,43 @@ def normalize_candles(values):
         })
 
     # Twelve Data normally returns newest first.
-    # Convert to oldest -> newest.
-    clean.reverse()
+    # Sorting by datetime makes the internal series reliably
+    # oldest -> newest regardless of API response ordering.
+
+    def sort_key(x):
+
+        return x.get(
+            "datetime",
+            ""
+        )
+
+    try:
+
+        normalized.sort(
+            key=sort_key
+        )
+
+    except Exception:
+
+        pass
 
     # Remove duplicate timestamps.
     unique = []
-
     seen = set()
 
-    for candle in clean:
+    for candle in normalized:
 
-        key = candle["datetime"]
+        key = candle.get(
+            "datetime"
+        )
 
         if key in seen:
             continue
 
         seen.add(key)
-
         unique.append(candle)
 
     return unique
-
-
-# ============================================================
-# CACHE ACCESS
-# ============================================================
-
-def get_cached_candles(
-    symbol,
-    interval
-):
-
-    cache_key = f"{symbol}:{interval}"
-
-    with candle_cache_lock:
-
-        cached = candle_cache.get(
-            cache_key
-        )
-
-        if not cached:
-            return []
-
-        values = cached.get(
-            "values",
-            []
-        )
-
-        if not values:
-            return []
-
-        return list(values)
-
-
-def cache_candles(
-    symbol,
-    interval,
-    values
-):
-
-    if not values:
-        return
-
-    cache_key = f"{symbol}:{interval}"
-
-    with candle_cache_lock:
-
-        candle_cache[cache_key] = {
-
-            "timestamp": time.time(),
-
-            "values": list(values)
-
-        }
-
-
-def candle_cache_age(
-    symbol,
-    interval
-):
-
-    cache_key = f"{symbol}:{interval}"
-
-    with candle_cache_lock:
-
-        cached = candle_cache.get(
-            cache_key
-        )
-
-        if not cached:
-            return None
-
-        timestamp = cached.get(
-            "timestamp",
-            0
-        )
-
-    if timestamp <= 0:
-        return None
-
-    return max(
-        0,
-        time.time() - timestamp
-    )
-
-
-# ============================================================
-# PRICE BACKOFF
-# ============================================================
-
-def price_backoff_active():
-
-    with price_backoff_lock:
-
-        return (
-            time.time()
-            <
-            price_backoff_until
-        )
-
-
-def set_price_backoff(seconds=180):
-
-    global price_backoff_until
-
-    with price_backoff_lock:
-
-        price_backoff_until = (
-            time.time() +
-            seconds
-        )
-
-
-# ============================================================
-# CANDLE BACKOFF
-# ============================================================
-
-def candle_backoff_active(
-    interval
-):
-
-    with candle_backoff_lock:
-
-        return (
-            time.time()
-            <
-            candle_backoff_until.get(
-                interval,
-                0
-            )
-        )
-
-
-def set_candle_backoff(
-    interval,
-    seconds=180
-):
-
-    with candle_backoff_lock:
-
-        candle_backoff_until[
-            interval
-        ] = (
-            time.time() +
-            seconds
-        )
-
-
-# ============================================================
-# LIVE PRICE
-# ============================================================
-
-def get_live_price():
-
-    global price_backoff_until
-
-    if not API_KEY:
-
-        print(
-            "ERROR: TWELVE_DATA_API_KEY missing"
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # If WebSocket is already providing a fresh price,
-    # do NOT waste a REST API credit.
-    # --------------------------------------------------------
-
-    with lock:
-
-        ws_price = state["gold"].get(
-            "price"
-        )
-
-        ws_connection = state["gold"].get(
-            "connection"
-        )
-
-        ws_updated = state["gold"].get(
-            "updated"
-        )
-
-    if (
-        ws_price is not None
-        and ws_connection == "CONNECTED"
-        and ws_updated
-    ):
-
-        try:
-
-            current_seconds = (
-                time.time()
-            )
-
-            parsed = time.strptime(
-                ws_updated,
-                "%H:%M:%S"
-            )
-
-            now_struct = time.localtime(
-                current_seconds
-            )
-
-            updated_seconds = (
-                time.mktime(
-                    (
-                        now_struct.tm_year,
-                        now_struct.tm_mon,
-                        now_struct.tm_mday,
-                        parsed.tm_hour,
-                        parsed.tm_min,
-                        parsed.tm_sec,
-                        0,
-                        0,
-                        -1
-                    )
-                )
-            )
-
-            age = (
-                current_seconds -
-                updated_seconds
-            )
-
-            # Small protection around midnight.
-            if age < 0:
-                age = 0
-
-            if age < 90:
-
-                return ws_price
-
-        except Exception:
-
-            # If timestamp parsing fails,
-            # continue to cache / REST fallback.
-            pass
-
-    if price_backoff_active():
-
-        return None
-
-    now = time.time()
-
-    with price_cache_lock:
-
-        cached_price = price_cache.get(
-            "price"
-        )
-
-        cached_time = price_cache.get(
-            "timestamp",
-            0
-        )
-
-        if (
-            cached_price is not None
-            and
-            now - cached_time < 30
-        ):
-
-            return cached_price
-
-    # Prevent duplicate price requests.
-    if not price_request_lock.acquire(
-        blocking=False
-    ):
-
-        return None
-
-    try:
-
-        response = requests.get(
-            REST_PRICE_URL,
-            params={
-                "symbol": GOLD_SYMBOL,
-                "apikey": API_KEY
-            },
-            timeout=15
-        )
-
-        if response.status_code == 429:
-
-            print(
-                "PRICE 429 - Twelve Data rate limit"
-            )
-
-            set_price_backoff(
-                300
-            )
-
-            return None
-
-        if response.status_code != 200:
-
-            print(
-                "PRICE HTTP ERROR:",
-                response.status_code
-            )
-
-            return None
-
-        data = response.json()
-
-        if data.get("status") == "error":
-
-            message = data.get(
-                "message",
-                ""
-            )
-
-            print(
-                "PRICE API ERROR:",
-                message
-            )
-
-            # Credit/rate-limit style errors can sometimes
-            # arrive inside a JSON response with HTTP 200.
-            if "credit" in message.lower() \
-                    or "rate" in message.lower() \
-                    or "limit" in message.lower():
-
-                set_price_backoff(
-                    300
-                )
-
-            return None
-
-        price = number(
-            data.get("price")
-        )
-
-        if price is None:
-            return None
-
-        with price_cache_lock:
-
-            price_cache["price"] = price
-
-            price_cache["timestamp"] = (
-                time.time()
-            )
-
-        return price
-
-    except Exception as exc:
-
-        print(
-            "PRICE ERROR:",
-            repr(exc)
-        )
-
-        return None
-
-    finally:
-
-        try:
-            price_request_lock.release()
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -886,7 +720,10 @@ def get_candles(
             "ERROR: TWELVE_DATA_API_KEY missing"
         )
 
-        return []
+        return get_cached_candles(
+            symbol,
+            interval
+        )
 
     if interval not in CANDLE_INTERVALS:
 
@@ -897,93 +734,81 @@ def get_candles(
 
         return []
 
+
     now = time.time()
 
+    cache_key = (
+        f"{symbol}:{interval}"
+    )
+
     # --------------------------------------------------------
-    # First: return fresh cache.
+    # CACHE FIRST
     # --------------------------------------------------------
 
-    cached_values = get_cached_candles(
-        symbol,
+    with candle_cache_lock:
+
+        cached = candle_cache.get(
+            cache_key
+        )
+
+        if cached:
+
+            timestamp = cached.get(
+                "timestamp",
+                0
+            )
+
+            values = cached.get(
+                "values",
+                []
+            )
+
+            refresh_after = (
+                FETCH_INTERVALS.get(
+                    interval,
+                    300
+                )
+            )
+
+            # Fresh enough -> no API call.
+            if (
+                values
+                and
+                now - timestamp
+                < refresh_after
+            ):
+
+                return list(values)
+
+
+    # --------------------------------------------------------
+    # PER-TIMEFRAME BACKOFF
+    # --------------------------------------------------------
+
+    with candle_backoff_lock:
+
+        blocked_until = (
+            candle_backoff_until.get(
+                interval,
+                0
+            )
+        )
+
+        if now < blocked_until:
+
+            return get_cached_candles(
+                symbol,
+                interval
+            )
+
+
+    print(
+        "REQUESTING CANDLES:",
         interval
     )
 
-    cached_age = candle_cache_age(
-        symbol,
-        interval
-    )
-
-    refresh_after = FETCH_INTERVALS.get(
-        interval,
-        300
-    )
-
-    if (
-        cached_values
-        and
-        cached_age is not None
-        and
-        cached_age < refresh_after
-    ):
-
-        return cached_values
-
-    # --------------------------------------------------------
-    # If this particular timeframe is in backoff,
-    # return its own cache instead of blocking everything.
-    # --------------------------------------------------------
-
-    if candle_backoff_active(
-        interval
-    ):
-
-        return cached_values
-
-    request_lock = candle_request_locks.get(
-        interval
-    )
-
-    if request_lock is None:
-        return cached_values
-
-    # --------------------------------------------------------
-    # Prevent duplicate request.
-    # --------------------------------------------------------
-
-    if not request_lock.acquire(
-        blocking=False
-    ):
-
-        return cached_values
 
     try:
-
-        # Another thread may have refreshed it while
-        # this thread was waiting.
-        latest_cached = get_cached_candles(
-            symbol,
-            interval
-        )
-
-        latest_age = candle_cache_age(
-            symbol,
-            interval
-        )
-
-        if (
-            latest_cached
-            and
-            latest_age is not None
-            and
-            latest_age < refresh_after
-        ):
-
-            return latest_cached
-
-        print(
-            "REQUESTING CANDLES:",
-            interval
-        )
 
         response = requests.get(
             REST_TIME_SERIES_URL,
@@ -993,7 +818,7 @@ def get_candles(
                 "outputsize": outputsize,
                 "apikey": API_KEY
             },
-            timeout=20
+            timeout=15
         )
 
         # ----------------------------------------------------
@@ -1008,18 +833,23 @@ def get_candles(
                 "- preserving cache"
             )
 
-            set_candle_backoff(
-                interval,
-                300
-            )
+            with candle_backoff_lock:
+
+                candle_backoff_until[
+                    interval
+                ] = (
+                    time.time()
+                    + 900
+                )
 
             return get_cached_candles(
                 symbol,
                 interval
             )
 
+
         # ----------------------------------------------------
-        # OTHER HTTP ERRORS
+        # OTHER HTTP ERROR
         # ----------------------------------------------------
 
         if response.status_code != 200:
@@ -1030,10 +860,20 @@ def get_candles(
                 response.status_code
             )
 
+            with candle_backoff_lock:
+
+                candle_backoff_until[
+                    interval
+                ] = (
+                    time.time()
+                    + 120
+                )
+
             return get_cached_candles(
                 symbol,
                 interval
             )
+
 
         # ----------------------------------------------------
         # JSON
@@ -1043,18 +883,18 @@ def get_candles(
 
             data = response.json()
 
-        except Exception as exc:
+        except Exception:
 
             print(
                 "CANDLE JSON ERROR:",
-                interval,
-                repr(exc)
+                interval
             )
 
             return get_cached_candles(
                 symbol,
                 interval
             )
+
 
         # ----------------------------------------------------
         # API ERROR
@@ -1073,86 +913,87 @@ def get_candles(
                 message
             )
 
-            message_lower = str(
-                message
-            ).lower()
-
-            if (
-                "credit" in message_lower
-                or
-                "rate" in message_lower
-                or
-                "limit" in message_lower
-                or
-                "quota" in message_lower
-            ):
-
-                set_candle_backoff(
-                    interval,
-                    300
-                )
-
+            # Do not destroy valid cache.
             return get_cached_candles(
                 symbol,
                 interval
             )
 
-        # ----------------------------------------------------
-        # VALUES
-        # ----------------------------------------------------
 
-        raw_values = data.get(
+        values = data.get(
             "values",
             []
         )
 
-        values = normalize_candles(
-            raw_values
-        )
 
         if not values:
 
             print(
-                "CANDLE EMPTY:",
-                interval,
-                "- preserving cache"
+                "NO CANDLES RETURNED:",
+                interval
             )
 
             return get_cached_candles(
                 symbol,
                 interval
             )
+
+
+        values = normalize_candles(
+            values
+        )
+
+
+        if not values:
+
+            print(
+                "CANDLE NORMALIZATION EMPTY:",
+                interval
+            )
+
+            return get_cached_candles(
+                symbol,
+                interval
+            )
+
 
         # ----------------------------------------------------
         # SUCCESS
         # ----------------------------------------------------
 
-        cache_candles(
-            symbol,
-            interval,
-            values
-        )
+        with candle_cache_lock:
+
+            candle_cache[
+                cache_key
+            ] = {
+
+                "timestamp":
+                    time.time(),
+
+                "values":
+                    values
+
+            }
+
+
+        # Successful request clears that timeframe's
+        # backoff immediately.
+        with candle_backoff_lock:
+
+            candle_backoff_until[
+                interval
+            ] = 0
+
 
         print(
             "CANDLES UPDATED:",
             interval,
+            "count=",
             len(values)
         )
 
         return values
 
-    except requests.RequestException as exc:
-
-        print(
-            "CANDLE REQUEST ERROR:",
-            interval,
-            repr(exc)
-        )
-
-        return get_cached_candles(
-            symbol,
-            interval
-        )
 
     except Exception as exc:
 
@@ -1166,13 +1007,6 @@ def get_candles(
             symbol,
             interval
         )
-
-    finally:
-
-        try:
-            request_lock.release()
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -1258,17 +1092,17 @@ def analyze_timeframe(candles):
     ):
 
         if (
-            current >
-            ema20_value >
-            ema50_value
+            current
+            > ema20_value
+            > ema50_value
         ):
 
             trend = "BULLISH"
 
         elif (
-            current <
-            ema20_value <
-            ema50_value
+            current
+            < ema20_value
+            < ema50_value
         ):
 
             trend = "BEARISH"
@@ -1280,6 +1114,7 @@ def analyze_timeframe(candles):
     else:
 
         trend = "NEUTRAL"
+
 
     # --------------------------------------------------------
     # MOMENTUM
@@ -1301,6 +1136,7 @@ def analyze_timeframe(candles):
 
         momentum = "NEUTRAL"
 
+
     # --------------------------------------------------------
     # STRUCTURE
     # --------------------------------------------------------
@@ -1310,13 +1146,13 @@ def analyze_timeframe(candles):
     if len(recent) >= 10:
 
         old_average = (
-            sum(recent[:5]) /
-            5
+            sum(recent[:5])
+            / 5
         )
 
         new_average = (
-            sum(recent[-5:]) /
-            5
+            sum(recent[-5:])
+            / 5
         )
 
         if new_average > old_average:
@@ -1335,6 +1171,7 @@ def analyze_timeframe(candles):
 
         structure = "RANGE"
 
+
     # --------------------------------------------------------
     # LIQUIDITY
     # --------------------------------------------------------
@@ -1351,21 +1188,14 @@ def analyze_timeframe(candles):
         else support
     )
 
+
     # --------------------------------------------------------
     # LIQUIDITY SWEEP
     # --------------------------------------------------------
 
     sweep = "NONE"
 
-    if (
-        len(candles) >= 3
-        and
-        len(highs) >= 3
-        and
-        len(lows) >= 3
-        and
-        len(closes) >= 3
-    ):
+    if len(candles) >= 3:
 
         previous_high = max(
             highs[-3:-1]
@@ -1382,24 +1212,21 @@ def analyze_timeframe(candles):
         latest_close = closes[-1]
 
         if (
-            latest_high >
-            previous_high
+            latest_high > previous_high
             and
-            latest_close <
-            previous_high
+            latest_close < previous_high
         ):
 
             sweep = "HIGH SWEEP"
 
         elif (
-            latest_low <
-            previous_low
+            latest_low < previous_low
             and
-            latest_close >
-            previous_low
+            latest_close > previous_low
         ):
 
             sweep = "LOW SWEEP"
+
 
     return {
 
@@ -1511,6 +1338,7 @@ def build_ai_analysis(
         {}
     )
 
+
     def add(
         condition,
         points,
@@ -1527,97 +1355,90 @@ def build_ai_analysis(
                 reason
             )
 
-    # --------------------------------------------------------
-    # 5M
-    # --------------------------------------------------------
 
     add(
-        five.get("trend") == "BULLISH",
+        five.get("trend")
+        == "BULLISH",
         2,
         "5m trend bullish"
     )
 
     add(
-        five.get("trend") == "BEARISH",
+        five.get("trend")
+        == "BEARISH",
         -2,
         "5m trend bearish"
     )
 
     add(
-        five.get("momentum") == "BUYING",
+        five.get("momentum")
+        == "BUYING",
         1,
         "5m momentum buying"
     )
 
     add(
-        five.get("momentum") == "SELLING",
+        five.get("momentum")
+        == "SELLING",
         -1,
         "5m momentum selling"
     )
 
-    # --------------------------------------------------------
-    # 15M
-    # --------------------------------------------------------
-
     add(
-        fifteen.get("trend") == "BULLISH",
+        fifteen.get("trend")
+        == "BULLISH",
         2,
         "15m trend bullish"
     )
 
     add(
-        fifteen.get("trend") == "BEARISH",
+        fifteen.get("trend")
+        == "BEARISH",
         -2,
         "15m trend bearish"
     )
 
     add(
-        fifteen.get("structure") == "HIGHER",
+        fifteen.get("structure")
+        == "HIGHER",
         1,
         "15m structure higher"
     )
 
     add(
-        fifteen.get("structure") == "LOWER",
+        fifteen.get("structure")
+        == "LOWER",
         -1,
         "15m structure lower"
     )
 
-    # --------------------------------------------------------
-    # 1H
-    # --------------------------------------------------------
-
     add(
-        one_hour.get("trend") == "BULLISH",
+        one_hour.get("trend")
+        == "BULLISH",
         2,
         "1H trend bullish"
     )
 
     add(
-        one_hour.get("trend") == "BEARISH",
+        one_hour.get("trend")
+        == "BEARISH",
         -2,
         "1H trend bearish"
     )
 
-    # --------------------------------------------------------
-    # 4H
-    # --------------------------------------------------------
-
     add(
-        four_hour.get("trend") == "BULLISH",
+        four_hour.get("trend")
+        == "BULLISH",
         1,
         "4H trend bullish"
     )
 
     add(
-        four_hour.get("trend") == "BEARISH",
+        four_hour.get("trend")
+        == "BEARISH",
         -1,
         "4H trend bearish"
     )
-
-    # --------------------------------------------------------
-    # LIQUIDITY SWEEP
-    # --------------------------------------------------------
 
     sweep = five.get(
         "sweep",
@@ -1636,9 +1457,6 @@ def build_ai_analysis(
         "5m high-liquidity sweep"
     )
 
-    # --------------------------------------------------------
-    # BOUND SCORE
-    # --------------------------------------------------------
 
     score = max(
         -10,
@@ -1648,9 +1466,6 @@ def build_ai_analysis(
         )
     )
 
-    # --------------------------------------------------------
-    # DECISION
-    # --------------------------------------------------------
 
     if score >= 6:
 
@@ -1664,6 +1479,7 @@ def build_ai_analysis(
 
         decision = "WAIT"
 
+
     confidence = max(
         50,
         min(
@@ -1671,6 +1487,7 @@ def build_ai_analysis(
             50 + abs(score) * 5
         )
     )
+
 
     return {
 
@@ -1681,6 +1498,7 @@ def build_ai_analysis(
         "score": score,
 
         "reasons": reasons
+
     }
 
 
@@ -1713,16 +1531,20 @@ def build_market_phase(
         "WAIT"
     )
 
+
     if signal == "BUY":
 
         phase = "BULLISH PHASE"
 
         if (
-            five.get("trend") == "BULLISH"
+            five.get("trend")
+            == "BULLISH"
             and
-            fifteen.get("trend") == "BULLISH"
+            fifteen.get("trend")
+            == "BULLISH"
             and
-            one_hour.get("trend") == "BULLISH"
+            one_hour.get("trend")
+            == "BULLISH"
         ):
 
             duration = (
@@ -1738,16 +1560,20 @@ def build_market_phase(
                 "watch for 5m structure failure."
             )
 
+
     elif signal == "SELL":
 
         phase = "BEARISH PHASE"
 
         if (
-            five.get("trend") == "BEARISH"
+            five.get("trend")
+            == "BEARISH"
             and
-            fifteen.get("trend") == "BEARISH"
+            fifteen.get("trend")
+            == "BEARISH"
             and
-            one_hour.get("trend") == "BEARISH"
+            one_hour.get("trend")
+            == "BEARISH"
         ):
 
             duration = (
@@ -1763,6 +1589,7 @@ def build_market_phase(
                 "watch for 5m structure recovery."
             )
 
+
     else:
 
         phase = "TRANSITION / RANGE"
@@ -1772,11 +1599,13 @@ def build_market_phase(
             "Wait for multi-timeframe confirmation."
         )
 
+
     return {
 
         "phase": phase,
 
         "duration": duration
+
     }
 
 
@@ -1818,7 +1647,9 @@ def build_trade_plan(
                 "reasons",
                 []
             )
+
         }
+
 
     five = timeframes.get(
         "5min",
@@ -1829,6 +1660,7 @@ def build_trade_plan(
         "15min",
         {}
     )
+
 
     support = (
         five.get("support")
@@ -1842,9 +1674,11 @@ def build_trade_plan(
         fifteen.get("resistance")
     )
 
+
     entry = float(
         live_price
     )
+
 
     if ai["signal"] == "SELL":
 
@@ -1874,6 +1708,7 @@ def build_trade_plan(
             3 * risk
         )
 
+
     else:
 
         stop = (
@@ -1901,6 +1736,7 @@ def build_trade_plan(
         t3 = entry + (
             3 * risk
         )
+
 
     return {
 
@@ -1943,6 +1779,7 @@ def build_trade_plan(
             "reasons",
             []
         )
+
     }
 
 
@@ -1958,10 +1795,14 @@ def record_signal_history(
     if live_price is None:
         return
 
-    history = state["gold"].setdefault(
+
+    history = state[
+        "gold"
+    ].setdefault(
         "signal_history",
         []
     )
+
 
     previous = (
         history[-1]
@@ -1969,676 +1810,133 @@ def record_signal_history(
         else None
     )
 
+
     if (
         previous
         and
-        previous.get("score") ==
-        ai["score"]
+        previous.get("score")
+        == ai["score"]
         and
-        previous.get("signal") ==
-        ai["signal"]
+        previous.get("signal")
+        == ai["signal"]
     ):
 
         return
 
+
     history.append({
 
-        "time": now_text(),
+        "time":
+            now_text(),
 
-        "price": round(
-            float(live_price),
-            3
-        ),
+        "price":
+            round(
+                float(live_price),
+                3
+            ),
 
-        "score": ai["score"],
+        "score":
+            ai["score"],
 
-        "signal": ai["signal"],
+        "signal":
+            ai["signal"],
 
         "confidence":
             ai["confidence"],
 
-        "reasons": ai.get(
-            "reasons",
-            []
-        )[:8]
+        "reasons":
+            ai.get(
+                "reasons",
+                []
+            )[:8]
+
     })
 
-    state["gold"]["signal_history"] = (
+
+    state[
+        "gold"
+    ]["signal_history"] = (
         history[-50:]
     )
 
 
 # ============================================================
-# ANALYSIS STATE UPDATE
+# PRESERVE EXISTING ANALYSIS
 # ============================================================
 
-def apply_analysis(
-    timeframe_data,
-    live_price
+def merge_timeframe_data(
+    existing,
+    fresh
 ):
 
-    if not timeframe_data:
-        return False
+    result = dict(existing or {})
 
-    # --------------------------------------------------------
-    # Keep previously valid timeframe data.
-    # --------------------------------------------------------
+    for interval, value in (
+        fresh or {}
+    ).items():
 
-    with lock:
+        if value:
 
-        previous_timeframes = (
-            state["gold"].get(
-                "timeframes",
-                {}
-            )
-        )
+            result[interval] = value
 
-    merged_timeframes = dict(
-        previous_timeframes
-    )
-
-    for interval, result in (
-        timeframe_data.items()
-    ):
-
-        if result:
-
-            merged_timeframes[
-                interval
-            ] = result
-
-    # Need enough core data before generating fresh AI.
-    required = [
-        "5min",
-        "15min",
-        "1h",
-        "4h"
-    ]
-
-    available_core = sum(
-        1
-        for interval in required
-        if merged_timeframes.get(
-            interval
-        )
-    )
-
-    if available_core == 0:
-
-        return False
-
-    with lock:
-
-        current_price = (
-            state["gold"].get(
-                "price"
-            )
-        )
-
-    if live_price is None:
-
-        live_price = current_price
-
-    if live_price is None:
-
-        live_price = (
-            merged_timeframes
-            .get("5min", {})
-            .get("price")
-        )
-
-    if live_price is None:
-
-        return False
-
-    # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
-
-    ai = build_ai_analysis(
-        merged_timeframes,
-        live_price
-    )
-
-    phase = build_market_phase(
-        merged_timeframes,
-        ai
-    )
-
-    trade_plan = build_trade_plan(
-        merged_timeframes,
-        live_price,
-        ai
-    )
-
-    five = merged_timeframes.get(
-        "5min",
-        {}
-    )
-
-    # --------------------------------------------------------
-    # Update state atomically.
-    # --------------------------------------------------------
-
-    with lock:
-
-        state["gold"]["timeframes"] = (
-            merged_timeframes
-        )
-
-        state["gold"]["candles"] = {
-
-            k: v.get(
-                "candles",
-                []
-            )
-
-            for k, v
-            in merged_timeframes.items()
-
-            if isinstance(v, dict)
-        }
-
-        state["gold"]["trade_plan"] = (
-            trade_plan
-        )
-
-        state["gold"]["market_phase"] = (
-            phase
-        )
-
-        # Only replace primary metrics when
-        # 5m analysis is actually available.
-
-        if five:
-
-            state["gold"].update({
-
-                "trend": five.get(
-                    "trend",
-                    "NEUTRAL"
-                ),
-
-                "momentum": five.get(
-                    "momentum",
-                    "NEUTRAL"
-                ),
-
-                "structure": five.get(
-                    "structure",
-                    "RANGE"
-                ),
-
-                "rsi": five.get(
-                    "rsi"
-                ),
-
-                "ema20": five.get(
-                    "ema20"
-                ),
-
-                "ema50": five.get(
-                    "ema50"
-                ),
-
-                "support": five.get(
-                    "support"
-                ),
-
-                "resistance": five.get(
-                    "resistance"
-                ),
-
-                "liquidity_high":
-                    five.get(
-                        "liquidity_high"
-                    ),
-
-                "liquidity_low":
-                    five.get(
-                        "liquidity_low"
-                    ),
-
-                "sweep": five.get(
-                    "sweep",
-                    "NONE"
-                )
-            })
-
-        state["gold"]["signal"] = (
-            ai["signal"]
-        )
-
-        state["gold"]["confidence"] = (
-            ai["confidence"]
-        )
-
-        state["gold"]["score"] = (
-            ai["score"]
-        )
-
-        state["gold"]["updated"] = (
-            now_text()
-        )
-
-        # Do not overwrite a healthy WebSocket
-        # connection with REST state.
-
-        if (
-            state["gold"].get(
-                "connection"
-            )
-            !=
-            "CONNECTED"
-        ):
-
-            state["gold"]["connection"] = (
-                "CONNECTED"
-            )
-
-        state["gold"]["error"] = None
-
-        record_signal_history(
-            ai,
-            live_price
-        )
-
-    print(
-        "AI UPDATE:",
-        f"price={live_price}",
-        f"score={ai['score']}",
-        f"decision={ai['signal']}"
-    )
-
-    broadcast()
-
-    return True
+    return result
 
 
-# ============================================================
-# CANDLE REFRESH SCHEDULER
-# ============================================================
-#
-# One controlled scheduler handles all timeframes.
-#
-# Core analysis timeframes receive priority.
-# 1m and 1D are intentionally lower priority.
-#
-# This prevents six simultaneous API requests every 3 minutes.
-# ============================================================
-
-def refresh_one_interval(
-    interval
+def rebuild_candles_from_timeframes(
+    timeframe_data
 ):
 
-    candles = get_candles(
-        GOLD_SYMBOL,
-        interval,
-        100
-    )
+    result = {}
 
-    if not candles:
+    for interval, item in (
+        timeframe_data or {}
+    ).items():
 
-        return False
+        candles = item.get(
+            "candles",
+            []
+        )
 
-    result = analyze_timeframe(
-        candles
-    )
+        if candles:
 
-    if not result:
-
-        return False
-
-    result["candles"] = (
-        candles[-120:]
-    )
-
-    with lock:
-
-        # Preserve the existing analysis
-        # for every other timeframe.
-
-        current = dict(
-            state["gold"].get(
-                "timeframes",
-                {}
+            result[interval] = (
+                candles
             )
-        )
 
-        current[interval] = result
+    # Also preserve any cached timeframe not currently
+    # returned by the analysis cycle.
+    with candle_cache_lock:
 
-    with lock:
+        for interval in CANDLE_INTERVALS:
 
-        live_price = (
-            state["gold"].get(
-                "price"
+            key = (
+                f"{GOLD_SYMBOL}:"
+                f"{interval}"
             )
-        )
 
-    return apply_analysis(
-        {
-            interval: result
-        },
-        live_price
-    )
+            cached = candle_cache.get(
+                key
+            )
 
+            if cached:
 
-def get_stale_intervals():
-
-    stale = []
-
-    for interval in CORE_ANALYSIS_INTERVALS:
-
-        age = candle_cache_age(
-            GOLD_SYMBOL,
-            interval
-        )
-
-        refresh_after = FETCH_INTERVALS.get(
-            interval,
-            300
-        )
-
-        if age is None:
-
-            stale.append(
-                (
-                    interval,
-                    True,
-                    0
+                values = cached.get(
+                    "values",
+                    []
                 )
-            )
 
-        elif age >= refresh_after:
+                if values:
 
-            stale.append(
-                (
-                    interval,
-                    False,
-                    age
-                )
-            )
-
-    # Core first.
-    return stale
-
-
-# ============================================================
-# ANALYSIS LOOP
-# ============================================================
-
-def gold_analysis_loop():
-
-    # Stagger first startup requests.
-    #
-    # This is deliberate:
-    # 5m -> 15m -> 1h -> 4h
-    #
-    # We do not fire six requests at once.
-
-    startup_sequence = [
-        "5min",
-        "15min",
-        "1h",
-        "4h"
-    ]
-
-    for interval in startup_sequence:
-
-        try:
-
-            print(
-                "STARTUP CANDLE LOAD:",
-                interval
-            )
-
-            refresh_one_interval(
-                interval
-            )
-
-        except Exception as exc:
-
-            print(
-                "STARTUP ANALYSIS ERROR:",
-                interval,
-                repr(exc)
-            )
-
-        # Small spacing between API calls.
-        time.sleep(5)
-
-    # --------------------------------------------------------
-    # Continuous operation
-    # --------------------------------------------------------
-
-    last_chart_refresh = {
-        "1min": 0,
-        "1day": 0
-    }
-
-    while True:
-
-        try:
-
-            did_work = False
-
-            # ------------------------------------------------
-            # CORE ANALYSIS TIMEFRAMES
-            # ------------------------------------------------
-
-            stale = get_stale_intervals()
-
-            for (
-                interval,
-                is_missing,
-                age
-            ) in stale:
-
-                try:
-
-                    print(
-                        "REFRESH CORE:",
+                    result.setdefault(
                         interval,
-                        "age=",
-                        round(age, 1)
+                        values[-120:]
                     )
 
-                    success = refresh_one_interval(
-                        interval
-                    )
-
-                    if success:
-                        did_work = True
-
-                except Exception as exc:
-
-                    print(
-                        "CORE REFRESH ERROR:",
-                        interval,
-                        repr(exc)
-                    )
-
-                # Do not fire requests back-to-back.
-                time.sleep(3)
-
-            # ------------------------------------------------
-            # 1MIN CHART
-            # ------------------------------------------------
-
-            now = time.time()
-
-            if (
-                now -
-                last_chart_refresh["1min"]
-                >=
-                FETCH_INTERVALS["1min"]
-            ):
-
-                try:
-
-                    candles = get_candles(
-                        GOLD_SYMBOL,
-                        "1min",
-                        100
-                    )
-
-                    if candles:
-
-                        result = analyze_timeframe(
-                            candles
-                        )
-
-                        if result:
-
-                            result["candles"] = (
-                                candles[-120:]
-                            )
-
-                            with lock:
-
-                                current = dict(
-                                    state["gold"].get(
-                                        "timeframes",
-                                        {}
-                                    )
-                                )
-
-                                current["1min"] = (
-                                    result
-                                )
-
-                            # Chart data is stored even if
-                            # it is not used for AI scoring.
-
-                            with lock:
-
-                                state["gold"].setdefault(
-                                    "timeframes",
-                                    {}
-                                )["1min"] = result
-
-                                state["gold"].setdefault(
-                                    "candles",
-                                    {}
-                                )["1min"] = (
-                                    candles[-120:]
-                                )
-
-                            broadcast()
-
-                        last_chart_refresh[
-                            "1min"
-                        ] = now
-
-                except Exception as exc:
-
-                    print(
-                        "1MIN REFRESH ERROR:",
-                        repr(exc)
-                    )
-
-                    last_chart_refresh[
-                        "1min"
-                    ] = now
-
-            # ------------------------------------------------
-            # 1DAY CHART
-            # ------------------------------------------------
-
-            now = time.time()
-
-            if (
-                now -
-                last_chart_refresh["1day"]
-                >=
-                FETCH_INTERVALS["1day"]
-            ):
-
-                try:
-
-                    candles = get_candles(
-                        GOLD_SYMBOL,
-                        "1day",
-                        100
-                    )
-
-                    if candles:
-
-                        result = analyze_timeframe(
-                            candles
-                        )
-
-                        if result:
-
-                            result["candles"] = (
-                                candles[-120:]
-                            )
-
-                            with lock:
-
-                                state["gold"].setdefault(
-                                    "timeframes",
-                                    {}
-                                )["1day"] = result
-
-                                state["gold"].setdefault(
-                                    "candles",
-                                    {}
-                                )["1day"] = (
-                                    candles[-120:]
-                                )
-
-                            broadcast()
-
-                        last_chart_refresh[
-                            "1day"
-                        ] = now
-
-                except Exception as exc:
-
-                    print(
-                        "1DAY REFRESH ERROR:",
-                        repr(exc)
-                    )
-
-                    last_chart_refresh[
-                        "1day"
-                    ] = now
-
-            # ------------------------------------------------
-            # If nothing needed updating, sleep modestly.
-            # ------------------------------------------------
-
-            if not did_work:
-
-                time.sleep(15)
-
-            else:
-
-                time.sleep(10)
-
-        except Exception as exc:
-
-            print(
-                "AI LOOP ERROR:",
-                repr(exc)
-            )
-
-            # Critical:
-            # Do NOT wipe the existing valid analysis.
-            with lock:
-
-                state["gold"]["error"] = (
-                    str(exc)
-                )
-
-            broadcast()
-
-            time.sleep(20)
+    return result
 
 
 # ============================================================
-# REST PRICE FALLBACK LOOP
+# REST PRICE LOOP
 # ============================================================
 
 def gold_price_loop():
@@ -2648,48 +1946,41 @@ def gold_price_loop():
         try:
 
             # ------------------------------------------------
-            # WebSocket is the preferred live price source.
-            # REST is fallback only when WS is not fresh.
+            # WebSocket-first.
+            # REST is only a fallback when WS price is stale.
             # ------------------------------------------------
 
-            with lock:
+            with ws_status_lock:
 
-                connection = (
-                    state["gold"].get(
-                        "connection"
-                    )
+                ws_age = (
+                    time.time()
+                    - ws_last_price_time
                 )
 
-                price = (
-                    state["gold"].get(
-                        "price"
-                    )
-                )
+            if ws_age >= 90:
 
-            if (
-                connection == "CONNECTED"
-                and
-                price is not None
-            ):
+                price = get_live_price()
+
+                if price is not None:
+
+                    # If WebSocket isn't supplying live data,
+                    # this is the REST fallback.
+                    set_gold_price(
+                        price,
+                        "Twelve Data REST"
+                    )
+
+                    print(
+                        "GOLD REST FALLBACK PRICE:",
+                        price
+                    )
+
+            else:
 
                 # WS is healthy.
-                # Do not spend REST credits.
-                time.sleep(30)
-                continue
+                # Do not consume another REST credit.
+                pass
 
-            rest_price = get_live_price()
-
-            if rest_price is not None:
-
-                set_gold_price(
-                    rest_price,
-                    "Twelve Data REST"
-                )
-
-                print(
-                    "GOLD REST FALLBACK PRICE:",
-                    rest_price
-                )
 
         except Exception as exc:
 
@@ -2698,7 +1989,449 @@ def gold_price_loop():
                 repr(exc)
             )
 
+
+        # This is intentionally long because WebSocket
+        # supplies the live price.
         time.sleep(30)
+
+
+# ============================================================
+# STARTUP CANDLE LOAD
+# ============================================================
+
+def startup_core_candles():
+
+    # Load core timeframes one by one.
+    #
+    # If Twelve Data returns 429, the function preserves any
+    # cache and moves on. It does NOT stop the other timeframes.
+
+    for interval in CORE_INTERVALS:
+
+        try:
+
+            print(
+                "STARTUP CANDLE LOAD:",
+                interval
+            )
+
+            candles = get_candles(
+                GOLD_SYMBOL,
+                interval,
+                100
+            )
+
+            if candles:
+
+                print(
+                    "STARTUP CANDLE READY:",
+                    interval,
+                    len(candles)
+                )
+
+            else:
+
+                print(
+                    "STARTUP CANDLE EMPTY:",
+                    interval
+                )
+
+        except Exception as exc:
+
+            print(
+                "STARTUP CANDLE ERROR:",
+                interval,
+                repr(exc)
+            )
+
+        # Avoid sending requests back-to-back.
+        time.sleep(5)
+
+
+# ============================================================
+# ANALYSIS LOOP
+# ============================================================
+
+def gold_analysis_loop():
+
+    # Small startup delay gives WebSocket time to connect.
+    time.sleep(3)
+
+    # --------------------------------------------------------
+    # Initial core load.
+    # --------------------------------------------------------
+
+    startup_core_candles()
+
+
+    # --------------------------------------------------------
+    # Main loop.
+    # --------------------------------------------------------
+
+    while True:
+
+        try:
+
+            fresh_timeframe_data = {}
+
+            # ------------------------------------------------
+            # CORE TIMEFRAMES ONLY
+            # ------------------------------------------------
+
+            for interval in CORE_INTERVALS:
+
+                candles = get_candles(
+                    GOLD_SYMBOL,
+                    interval,
+                    100
+                )
+
+                result = analyze_timeframe(
+                    candles
+                )
+
+                if result:
+
+                    result["candles"] = (
+                        candles[-120:]
+                    )
+
+                    fresh_timeframe_data[
+                        interval
+                    ] = result
+
+                # Do NOT make rapid requests.
+                time.sleep(2)
+
+
+            # ------------------------------------------------
+            # Preserve old valid analysis when one timeframe
+            # temporarily fails.
+            # ------------------------------------------------
+
+            with lock:
+
+                previous_timeframes = (
+                    state["gold"].get(
+                        "timeframes",
+                        {}
+                    )
+                )
+
+                timeframe_data = (
+                    merge_timeframe_data(
+                        previous_timeframes,
+                        fresh_timeframe_data
+                    )
+                )
+
+                live_price = (
+                    state["gold"].get(
+                        "price"
+                    )
+                )
+
+
+            # If WS price hasn't arrived yet, use the latest
+            # candle price.
+            if live_price is None:
+
+                live_price = (
+                    timeframe_data
+                    .get(
+                        "5min",
+                        {}
+                    )
+                    .get(
+                        "price"
+                    )
+                )
+
+
+            # ------------------------------------------------
+            # Need at least 5m data to build the dashboard.
+            # ------------------------------------------------
+
+            if timeframe_data:
+
+                ai = build_ai_analysis(
+                    timeframe_data,
+                    live_price
+                )
+
+                phase = build_market_phase(
+                    timeframe_data,
+                    ai
+                )
+
+                trade_plan = build_trade_plan(
+                    timeframe_data,
+                    live_price,
+                    ai
+                )
+
+                five = timeframe_data.get(
+                    "5min",
+                    {}
+                )
+
+
+                with lock:
+
+                    # ------------------------------------------------
+                    # Save complete merged timeframe analysis.
+                    # ------------------------------------------------
+
+                    state["gold"][
+                        "timeframes"
+                    ] = timeframe_data
+
+
+                    # ------------------------------------------------
+                    # Preserve candles from cache even if a current
+                    # REST request failed.
+                    # ------------------------------------------------
+
+                    state["gold"][
+                        "candles"
+                    ] = (
+                        rebuild_candles_from_timeframes(
+                            timeframe_data
+                        )
+                    )
+
+
+                    state["gold"][
+                        "trade_plan"
+                    ] = trade_plan
+
+
+                    state["gold"][
+                        "market_phase"
+                    ] = phase
+
+
+                    # ------------------------------------------------
+                    # Only overwrite core dashboard metrics when
+                    # 5m analysis is actually available.
+                    # ------------------------------------------------
+
+                    if five:
+
+                        state["gold"].update({
+
+                            "trend":
+                                five.get(
+                                    "trend",
+                                    "NEUTRAL"
+                                ),
+
+                            "momentum":
+                                five.get(
+                                    "momentum",
+                                    "NEUTRAL"
+                                ),
+
+                            "structure":
+                                five.get(
+                                    "structure",
+                                    "RANGE"
+                                ),
+
+                            "rsi":
+                                five.get(
+                                    "rsi"
+                                ),
+
+                            "ema20":
+                                five.get(
+                                    "ema20"
+                                ),
+
+                            "ema50":
+                                five.get(
+                                    "ema50"
+                                ),
+
+                            "support":
+                                five.get(
+                                    "support"
+                                ),
+
+                            "resistance":
+                                five.get(
+                                    "resistance"
+                                ),
+
+                            "liquidity_high":
+                                five.get(
+                                    "liquidity_high"
+                                ),
+
+                            "liquidity_low":
+                                five.get(
+                                    "liquidity_low"
+                                ),
+
+                            "sweep":
+                                five.get(
+                                    "sweep",
+                                    "NONE"
+                                ),
+
+                            "signal":
+                                ai[
+                                    "signal"
+                                ],
+
+                            "confidence":
+                                ai[
+                                    "confidence"
+                                ],
+
+                            "score":
+                                ai[
+                                    "score"
+                                ],
+
+                            "updated":
+                                now_text(),
+
+                            "error":
+                                None
+                        })
+
+
+                        record_signal_history(
+                            ai,
+                            live_price
+                        )
+
+
+                    print(
+                        "AI UPDATE:",
+                        f"price={live_price}",
+                        f"score={ai['score']}",
+                        f"decision={ai['signal']}"
+                    )
+
+
+                broadcast()
+
+
+            else:
+
+                # ------------------------------------------------
+                # No fresh data.
+                #
+                # IMPORTANT:
+                # Do NOT reset working metrics to WAITING.
+                # Keep the last valid dashboard.
+                # ------------------------------------------------
+
+                print(
+                    "AI UPDATE: no fresh candle data; "
+                    "preserving existing analysis"
+                )
+
+
+        except Exception as exc:
+
+            print(
+                "AI LOOP ERROR:",
+                repr(exc)
+            )
+
+            # Do NOT destroy existing analysis on an exception.
+            with lock:
+
+                # Only expose a short diagnostic if there was
+                # no valid analysis at all.
+                if not state["gold"].get(
+                    "timeframes"
+                ):
+
+                    state["gold"]["error"] = (
+                        str(exc)
+                    )
+
+            broadcast()
+
+
+        # ----------------------------------------------------
+        # Analysis scheduler.
+        #
+        # get_candles() itself enforces the real REST TTL,
+        # so this loop does not mean a request every 3 minutes.
+        # ----------------------------------------------------
+
+        time.sleep(60)
+
+
+# ============================================================
+# OPTIONAL LOW-FREQUENCY CHART CANDLE REFRESH
+# ============================================================
+
+def auxiliary_candle_loop():
+
+    # 1m and 1D are not required for AI decision making.
+    # They are refreshed slowly so the dashboard can eventually
+    # populate the timeframe buttons without hammering API.
+
+    time.sleep(20)
+
+    while True:
+
+        try:
+
+            for interval in [
+                "1min",
+                "1day"
+            ]:
+
+                try:
+
+                    candles = get_candles(
+                        GOLD_SYMBOL,
+                        interval,
+                        100
+                    )
+
+                    if candles:
+
+                        with lock:
+
+                            state[
+                                "gold"
+                            ][
+                                "candles"
+                            ][interval] = (
+                                candles[-120:]
+                            )
+
+                        broadcast()
+
+                except Exception as exc:
+
+                    print(
+                        "AUX CANDLE ERROR:",
+                        interval,
+                        repr(exc)
+                    )
+
+                time.sleep(5)
+
+
+        except Exception as exc:
+
+            print(
+                "AUX LOOP ERROR:",
+                repr(exc)
+            )
+
+
+        # The cache TTL controls actual REST requests.
+        time.sleep(60)
 
 
 # ============================================================
@@ -2721,9 +2454,11 @@ def gold_websocket_loop():
                     "TWELVE_DATA_API_KEY is missing"
                 )
 
+
             print(
                 "Connecting Twelve Data Gold WebSocket..."
             )
+
 
             ws_url = (
                 WS_URL
@@ -2731,23 +2466,32 @@ def gold_websocket_loop():
                 + API_KEY
             )
 
+
             ws = websocket.create_connection(
                 ws_url,
                 timeout=20
             )
 
+
             print(
                 "GOLD WS CONNECTED"
             )
 
+
             subscribe = {
 
-                "action": "subscribe",
+                "action":
+                    "subscribe",
 
                 "params": {
-                    "symbols": GOLD_SYMBOL
+
+                    "symbols":
+                        GOLD_SYMBOL
+
                 }
+
             }
+
 
             ws.send(
                 json.dumps(
@@ -2755,39 +2499,44 @@ def gold_websocket_loop():
                 )
             )
 
+
             print(
                 "GOLD WS SUBSCRIBED:",
                 GOLD_SYMBOL
             )
 
+
             with lock:
 
-                state["gold"]["connection"] = (
-                    "CONNECTED"
-                )
+                state[
+                    "gold"
+                ][
+                    "connection"
+                ] = "CONNECTED"
 
-                state["gold"]["error"] = None
+                state[
+                    "gold"
+                ][
+                    "error"
+                ] = None
 
-                state["gold"]["data_source"] = (
-                    "Twelve Data WebSocket + REST candles"
-                )
 
             broadcast()
 
+
             last_heartbeat = time.time()
+
 
             while True:
 
                 # ------------------------------------------------
-                # Heartbeat
+                # Heartbeat.
                 # ------------------------------------------------
 
                 if (
                     time.time()
-                    -
-                    last_heartbeat
-                    >
-                    10
+                    - last_heartbeat
+                    > 10
                 ):
 
                     try:
@@ -2795,7 +2544,7 @@ def gold_websocket_loop():
                         ws.send(
                             json.dumps({
                                 "action":
-                                "heartbeat"
+                                    "heartbeat"
                             })
                         )
 
@@ -2805,25 +2554,29 @@ def gold_websocket_loop():
 
                     except Exception:
 
-                        raise RuntimeError(
-                            "WebSocket heartbeat failed"
-                        )
+                        pass
+
 
                 ws.settimeout(15)
+
 
                 try:
 
                     raw = ws.recv()
 
-                except websocket.WebSocketTimeoutException:
+                except (
+                    websocket.WebSocketTimeoutException
+                ):
 
                     continue
+
 
                 if not raw:
 
                     raise RuntimeError(
                         "WebSocket closed"
                     )
+
 
                 try:
 
@@ -2835,9 +2588,11 @@ def gold_websocket_loop():
 
                     continue
 
+
                 event = message.get(
                     "event"
                 )
+
 
                 # ------------------------------------------------
                 # PRICE
@@ -2855,6 +2610,7 @@ def gold_websocket_loop():
                         )
                     )
 
+
                     if (
                         symbol == GOLD_SYMBOL
                         and
@@ -2865,6 +2621,7 @@ def gold_websocket_loop():
                             price,
                             "Twelve Data WebSocket"
                         )
+
 
                 # ------------------------------------------------
                 # SUBSCRIBE STATUS
@@ -2877,6 +2634,30 @@ def gold_websocket_loop():
                         message
                     )
 
+
+                    success = message.get(
+                        "success"
+                    )
+
+                    if success:
+
+                        with lock:
+
+                            state[
+                                "gold"
+                            ][
+                                "connection"
+                            ] = "CONNECTED"
+
+                            state[
+                                "gold"
+                            ][
+                                "error"
+                            ] = None
+
+                        broadcast()
+
+
                 # ------------------------------------------------
                 # HEARTBEAT
                 # ------------------------------------------------
@@ -2884,6 +2665,7 @@ def gold_websocket_loop():
                 elif event == "heartbeat":
 
                     pass
+
 
                 # ------------------------------------------------
                 # ERROR
@@ -2896,44 +2678,59 @@ def gold_websocket_loop():
                         message
                     )
 
+
         except Exception as exc:
 
             error_text = str(exc)
+
 
             print(
                 "GOLD WEBSOCKET ERROR:",
                 repr(exc)
             )
 
+
             with lock:
 
-                state["gold"]["connection"] = (
-                    "REST FALLBACK"
-                )
+                # Do not wipe the current live price.
+                state[
+                    "gold"
+                ][
+                    "connection"
+                ] = "REST FALLBACK"
 
-                state["gold"]["error"] = (
+                state[
+                    "gold"
+                ][
+                    "error"
+                ] = (
                     "WebSocket unavailable; "
                     "using REST fallback. "
                     + error_text
                 )
 
+
             broadcast()
+
 
         finally:
 
             try:
 
                 if ws is not None:
+
                     ws.close()
 
             except Exception:
 
                 pass
 
+
         print(
             "Gold WebSocket retry in "
             f"{reconnect_delay}s..."
         )
+
 
         time.sleep(
             reconnect_delay
@@ -2956,9 +2753,11 @@ def start_workers():
 
         workers_started = True
 
+
     print(
-        "Trading AI workers started."
+        "Starting Trading-AI workers..."
     )
+
 
     ws_thread = threading.Thread(
         target=gold_websocket_loop,
@@ -2968,6 +2767,7 @@ def start_workers():
 
     ws_thread.start()
 
+
     price_thread = threading.Thread(
         target=gold_price_loop,
         daemon=True,
@@ -2976,6 +2776,7 @@ def start_workers():
 
     price_thread.start()
 
+
     analysis_thread = threading.Thread(
         target=gold_analysis_loop,
         daemon=True,
@@ -2983,6 +2784,20 @@ def start_workers():
     )
 
     analysis_thread.start()
+
+
+    auxiliary_thread = threading.Thread(
+        target=auxiliary_candle_loop,
+        daemon=True,
+        name="GoldAuxiliaryCandles"
+    )
+
+    auxiliary_thread.start()
+
+
+    print(
+        "Trading AI workers started."
+    )
 
 
 # ============================================================
@@ -3004,29 +2819,36 @@ def api_market():
 
     start_workers()
 
-    with lock:
-
-        data = safe_json(
-            state
-        )
-
     return jsonify(
-        data
+        safe_copy_state()
     )
 
 
-# ============================================================
-# DIRECT CANDLE API
-# ============================================================
+# ------------------------------------------------------------
+# COMPATIBILITY ROUTE
 #
-# Additive route.
-# Existing dashboard does not depend on it, but it is useful
-# for reliable chart access and future UI improvements.
-# ============================================================
+# Some versions of the frontend requested /api/state.
+# Keep it so an old/new browser page cannot break the app.
+# ------------------------------------------------------------
 
-@app.route(
-    "/api/candles/<interval>"
-)
+@app.route("/api/state")
+def api_state():
+
+    start_workers()
+
+    return jsonify(
+        safe_copy_state()
+    )
+
+
+# ------------------------------------------------------------
+# DIRECT CANDLE ROUTE
+#
+# Additive backend route.
+# Does not change the existing dashboard design.
+# ------------------------------------------------------------
+
+@app.route("/api/candles/<interval>")
 def api_candles(interval):
 
     start_workers()
@@ -3037,8 +2859,9 @@ def api_candles(interval):
             "ok": False,
             "error": "Invalid timeframe",
             "interval": interval,
-            "candles": []
+            "allowed": CANDLE_INTERVALS
         }), 400
+
 
     candles = get_candles(
         GOLD_SYMBOL,
@@ -3046,15 +2869,19 @@ def api_candles(interval):
         100
     )
 
+
     return jsonify({
 
-        "ok": bool(candles),
+        "ok": True,
 
-        "symbol": GOLD_SYMBOL,
+        "symbol":
+            GOLD_SYMBOL,
 
-        "interval": interval,
+        "interval":
+            interval,
 
-        "candles": candles[-120:]
+        "candles":
+            candles[-120:]
 
     })
 
@@ -3064,9 +2891,11 @@ def stream():
 
     start_workers()
 
+
     client_queue = queue.Queue(
         maxsize=20
     )
+
 
     with clients_lock:
 
@@ -3074,25 +2903,25 @@ def stream():
             client_queue
         )
 
+
     def generate():
 
         try:
 
-            with lock:
-
-                initial = json.dumps(
-                    state,
-                    separators=(
-                        ",",
-                        ":"
-                    ),
-                    default=str
+            initial = json.dumps(
+                safe_copy_state(),
+                separators=(
+                    ",",
+                    ":"
                 )
+            )
+
 
             yield (
                 "event: market\n"
                 f"data: {initial}\n\n"
             )
+
 
             while True:
 
@@ -3104,10 +2933,12 @@ def stream():
                         )
                     )
 
+
                     yield (
                         "event: market\n"
                         f"data: {payload}\n\n"
                     )
+
 
                 except queue.Empty:
 
@@ -3115,16 +2946,11 @@ def stream():
                         ": heartbeat\n\n"
                     )
 
+
         except GeneratorExit:
 
             pass
 
-        except Exception as exc:
-
-            print(
-                "STREAM ERROR:",
-                repr(exc)
-            )
 
         finally:
 
@@ -3132,7 +2958,10 @@ def stream():
 
                 try:
 
-                    if client_queue in clients:
+                    if (
+                        client_queue
+                        in clients
+                    ):
 
                         clients.remove(
                             client_queue
@@ -3142,11 +2971,13 @@ def stream():
 
                     pass
 
+
     return Response(
 
         generate(),
 
-        mimetype="text/event-stream",
+        mimetype=
+            "text/event-stream",
 
         headers={
 
@@ -3160,6 +2991,7 @@ def stream():
                 "no"
 
         }
+
     )
 
 
@@ -3169,24 +3001,25 @@ def health():
     with lock:
 
         gold_connection = (
-            state["gold"]["connection"]
+            state["gold"][
+                "connection"
+            ]
         )
 
         gold_price = (
-            state["gold"]["price"]
+            state["gold"][
+                "price"
+            ]
         )
 
-        gold_error = (
-            state["gold"].get(
-                "error"
-            )
-        )
 
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "ok",
 
-        "service": "Trading-AI",
+        "service":
+            "Trading-AI",
 
         "gold_connection":
             gold_connection,
@@ -3194,16 +3027,17 @@ def health():
         "gold_price":
             gold_price,
 
-        "gold_error":
-            gold_error,
-
         "time":
             now_text()
+
     })
 
 
 # ============================================================
 # HTML DASHBOARD
+#
+# IMPORTANT:
+# This is the original dashboard layout.
 # ============================================================
 
 HTML = r"""
