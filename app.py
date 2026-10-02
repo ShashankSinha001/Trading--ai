@@ -30,37 +30,6 @@ CANDLE_INTERVALS = [
 ]
 
 # =========================================================
-# API-SAFETY / CACHE SETTINGS
-# =========================================================
-# The Basic plan allows 800 API credits/day.  The app therefore uses ONE
-# intraday REST request every 5 minutes and builds 5m/15m/30m/1H/4H locally.
-# Higher timeframes are requested only as rarely as they are needed.
-INTRADAY_REFRESH = 300
-DAILY_REFRESH = 86400
-WEEKLY_REFRESH = 604800
-MONTHLY_REFRESH = 2592000
-
-# Never let two REST calls hit Twelve Data simultaneously.
-api_request_lock = threading.Lock()
-
-# Per-endpoint cooldown after 429/network errors.
-api_backoff = {}
-api_backoff_lock = threading.Lock()
-
-# In-process last-good candle cache.  It survives transient 429s/errors.
-candle_cache = {}
-candle_cache_lock = threading.RLock()
-
-# Diagnostics only; the dashboard UI is unchanged.
-api_usage = {
-    "credits_used": None,
-    "credits_left": None,
-    "last_status": None,
-    "last_error": None,
-    "last_request": None,
-}
-
-# =========================================================
 # GLOBAL STATE
 # =========================================================
 
@@ -71,6 +40,34 @@ workers_started = False
 clients = []
 
 clients_lock = threading.Lock()
+
+# REST candle protection: one request at a time + global 429 cooldown.
+rest_lock = threading.Lock()
+rest_cooldown_until = 0.0
+rest_cooldown_lock = threading.Lock()
+
+candle_cache = {}
+candle_cache_lock = threading.RLock()
+
+CANDLE_SCHEDULE = {
+    "5min": 300,
+    "15min": 900,
+    "1h": 3600,
+    "4h": 14400,
+    "1day": 21600,
+    "1week": 86400,
+    "1month": 259200,
+}
+
+CANDLE_OUTPUTSIZE = {
+    "5min": 250,
+    "15min": 250,
+    "1h": 150,
+    "4h": 120,
+    "1day": 120,
+    "1week": 80,
+    "1month": 60,
+}
 
 state = {
     "gold": {
@@ -288,115 +285,109 @@ def rsi(values, period=14):
 # TWELVE DATA CANDLES
 # =========================================================
 
-def get_candles(symbol, interval, outputsize=100, force=False):
-    """
-    Safe Twelve Data candle fetcher.
+def get_candles(symbol, interval, outputsize=None):
+    """Quota-safe Twelve Data candle fetch with cache and global 429 cooldown."""
+    global rest_cooldown_until
 
-    Important: a 429 NEVER destroys good cached data and NEVER causes a tight
-    retry loop.  This is the main protection against the Basic 800/day limit.
-    """
     if not API_KEY:
         raise RuntimeError("TWELVE_DATA_API_KEY missing")
 
-    key = f"{symbol}|{interval}|{outputsize}"
+    if outputsize is None:
+        outputsize = CANDLE_OUTPUTSIZE.get(interval, 150)
+
     now = time.time()
+    ttl = CANDLE_SCHEDULE.get(interval, 900)
 
     with candle_cache_lock:
-        cached = candle_cache.get(key)
+        cached = candle_cache.get(interval)
+        if cached and now - cached["time"] < ttl:
+            return cached["rows"]
 
-    # Normal scheduler calls use the cache TTL.
-    ttl = {
-        "1min": INTRADAY_REFRESH,
-        "1day": DAILY_REFRESH,
-        "1week": WEEKLY_REFRESH,
-        "1month": MONTHLY_REFRESH,
-    }.get(interval, INTRADAY_REFRESH)
+    with rest_cooldown_lock:
+        if now < rest_cooldown_until:
+            remaining = int(rest_cooldown_until - now)
+            print(f"CANDLE REST COOLDOWN: {remaining}s")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    if cached and not force and now - cached["timestamp"] < ttl:
-        return cached["values"]
+    # Never allow several worker/request paths to hit Twelve Data simultaneously.
+    with rest_lock:
+        now = time.time()
+        with rest_cooldown_lock:
+            if now < rest_cooldown_until:
+                with candle_cache_lock:
+                    return candle_cache.get(interval, {}).get("rows", [])
 
-    with api_backoff_lock:
-        until = api_backoff.get(key, 0)
-    if not force and now < until:
-        return cached["values"] if cached else []
+        # Re-check cache after waiting for the lock.
+        with candle_cache_lock:
+            cached = candle_cache.get(interval)
+            if cached and now - cached["time"] < ttl:
+                return cached["rows"]
 
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": API_KEY,
-    }
+        print(f"REQUESTING CANDLES: {interval} outputsize={outputsize}")
 
-    api_usage["last_request"] = now_text()
-
-    try:
-        # Serialize REST requests so a price fallback and candle request cannot
-        # create a burst against the same API key.
-        with api_request_lock:
+        try:
             response = requests.get(
                 "https://api.twelvedata.com/time_series",
-                params=params,
+                params={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "outputsize": outputsize,
+                    "timezone": "UTC",
+                    "apikey": API_KEY,
+                },
                 timeout=20,
             )
-    except Exception as exc:
-        with api_backoff_lock:
-            api_backoff[key] = time.time() + 120
-        api_usage["last_status"] = "NETWORK ERROR"
-        api_usage["last_error"] = str(exc)
-        print(f"TWELVE DATA NETWORK ERROR: {interval}: {exc}")
-        return cached["values"] if cached else []
+        except Exception as exc:
+            print(f"CANDLE REQUEST ERROR: {interval}: {exc!r}")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    # Twelve Data exposes useful credit diagnostics in response headers.
-    api_usage["last_status"] = response.status_code
-    api_usage["credits_used"] = response.headers.get("api-credits-used")
-    api_usage["credits_left"] = response.headers.get("api-credits-left")
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
 
-    try:
-        data = response.json()
-    except Exception:
-        data = {}
+        # Record useful quota information when Twelve Data sends it.
+        left = response.headers.get("api-credits-left")
+        used = response.headers.get("api-credits-used")
+        if left is not None or used is not None:
+            print(f"TWELVE DATA CREDITS: used={used} left={left}")
 
-    is_429 = response.status_code == 429 or data.get("code") == 429
-    if is_429:
-        # The account page currently shows 874/800.  Do NOT hammer the API.
-        # A 30-minute cooldown also protects us from short rate-limit bursts.
-        with api_backoff_lock:
-            api_backoff[key] = time.time() + 1800
-        message = str(data.get("message") or "Twelve Data API limit reached (429)")
-        api_usage["last_error"] = message
-        print(f"TWELVE DATA 429: {interval} - keeping last good cache")
-        return cached["values"] if cached else []
+        if response.status_code == 429 or data.get("code") == 429:
+            # One 429 pauses ALL candle requests; this prevents a burst of
+            # 5m/15m/1h/4h retries from making the situation worse.
+            with rest_cooldown_lock:
+                rest_cooldown_until = time.time() + 900
+            msg = data.get("message") or "Twelve Data API limit reached (429)"
+            print(f"TWELVE DATA 429: {interval} - {msg}")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    if response.status_code != 200:
-        with api_backoff_lock:
-            api_backoff[key] = time.time() + 120
-        message = f"Twelve Data HTTP {response.status_code}: {data.get('message', response.text[:200])}"
-        api_usage["last_error"] = message
-        print(f"TWELVE DATA ERROR: {interval}: {message}")
-        return cached["values"] if cached else []
+        if response.status_code != 200:
+            msg = data.get("message") or response.text[:200]
+            print(f"TWELVE DATA HTTP {response.status_code}: {interval} - {msg}")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    if data.get("status") == "error":
-        message = str(data.get("message") or "Twelve Data returned an error")
-        api_usage["last_error"] = message
-        with api_backoff_lock:
-            api_backoff[key] = time.time() + 300
-        print(f"TWELVE DATA ERROR: {interval}: {message}")
-        return cached["values"] if cached else []
+        if data.get("status") == "error":
+            msg = data.get("message") or "Twelve Data returned an error"
+            print(f"TWELVE DATA ERROR: {interval} - {msg}")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    values = list(reversed(data.get("values") or []))
-    if not values:
-        print(f"TWELVE DATA EMPTY: {interval} - keeping last good cache")
-        return cached["values"] if cached else []
+        values = data.get("values") or []
+        rows = list(reversed(values))
+        if not rows:
+            print(f"TWELVE DATA EMPTY: {interval}")
+            with candle_cache_lock:
+                return candle_cache.get(interval, {}).get("rows", [])
 
-    with candle_cache_lock:
-        candle_cache[key] = {"timestamp": time.time(), "values": values}
+        with candle_cache_lock:
+            candle_cache[interval] = {"time": time.time(), "rows": rows}
 
-    with api_backoff_lock:
-        api_backoff.pop(key, None)
-
-    api_usage["last_error"] = None
-    print(f"REST OK: {interval} candles={len(values)} credits_left={api_usage.get('credits_left')}")
-    return values
+        print(f"REST OK: {interval} candles={len(rows)}")
+        return rows
 
 
 def candle_time(c):
@@ -718,129 +709,102 @@ def record_signal_history(ai, live_price):
 
 def gold_analysis_loop():
     """
-    Quota-safe analysis scheduler.
+    Stable multi-timeframe candle engine.
 
-    One 1-minute request every 5 minutes is used as the intraday source.
-    5m/15m/30m/1H/4H are aggregated locally.  Daily/weekly/monthly are
-    requested only at their own long refresh intervals.
+    Directly fetches the four decision timeframes at low frequency. This is
+    deliberately independent from the WebSocket price stream: a live price
+    tick must never trigger a REST candle request.
     """
-    last_intraday = 0.0
-    last_daily = 0.0
-    last_weekly = 0.0
-    last_monthly = 0.0
-
-    cached_intraday = []
-    cached_daily = []
-    cached_weekly = []
-    cached_monthly = []
+    last_attempt = {k: 0.0 for k in CANDLE_SCHEDULE}
 
     while True:
-        now = time.time()
         try:
-            if not cached_intraday or now - last_intraday >= INTRADAY_REFRESH:
-                rows = get_candles(GOLD_SYMBOL, "1min", 5000)
-                if rows:
-                    cached_intraday = rows
-                    last_intraday = now
+            now = time.time()
+            raw = {}
+
+            # Decision timeframes. Each is independently cached and scheduled.
+            for interval in ("5min", "15min", "1h", "4h"):
+                if now - last_attempt[interval] >= CANDLE_SCHEDULE[interval]:
+                    last_attempt[interval] = now
+                    rows = get_candles(GOLD_SYMBOL, interval)
+                    if rows:
+                        raw[interval] = rows
+                else:
+                    with candle_cache_lock:
+                        cached = candle_cache.get(interval, {})
+                        if cached.get("rows"):
+                            raw[interval] = cached["rows"]
+
+            # Long-term chart buttons; refresh slowly and never block the core
+            # 5m/15m/1h/4h analysis if these endpoints are unavailable.
+            for interval in ("1day", "1week", "1month"):
+                if now - last_attempt[interval] >= CANDLE_SCHEDULE[interval]:
+                    last_attempt[interval] = now
+                    rows = get_candles(GOLD_SYMBOL, interval)
+                    if rows:
+                        raw[interval] = rows
+                else:
+                    with candle_cache_lock:
+                        cached = candle_cache.get(interval, {})
+                        if cached.get("rows"):
+                            raw[interval] = cached["rows"]
 
             timeframe_data = {}
-
-            if cached_intraday:
-                raw_map = {
-                    "1min": cached_intraday,
-                    "5min": resample_candles(cached_intraday, 5 * 60),
-                    "15min": resample_candles(cached_intraday, 15 * 60),
-                    "30min": resample_candles(cached_intraday, 30 * 60),
-                    "1h": resample_candles(cached_intraday, 60 * 60),
-                    "4h": resample_candles(cached_intraday, 4 * 60 * 60),
-                }
-                for key, rows in raw_map.items():
-                    result = analyze_timeframe(rows)
-                    if result:
-                        result["candles"] = rows[-120:]
-                        timeframe_data[key] = result
-
-            # Keep the old 1D/1W/1M dashboard buttons functional, but request
-            # them only at their natural refresh cadence.
-            if not cached_daily or now - last_daily >= DAILY_REFRESH:
-                rows = get_candles(GOLD_SYMBOL, "1day", 100)
-                if rows:
-                    cached_daily = rows
-                    last_daily = now
-
-            if not cached_weekly or now - last_weekly >= WEEKLY_REFRESH:
-                rows = get_candles(GOLD_SYMBOL, "1week", 100)
-                if rows:
-                    cached_weekly = rows
-                    last_weekly = now
-
-            if not cached_monthly or now - last_monthly >= MONTHLY_REFRESH:
-                rows = get_candles(GOLD_SYMBOL, "1month", 100)
-                if rows:
-                    cached_monthly = rows
-                    last_monthly = now
-
-            for key, rows in (("1day", cached_daily), ("1week", cached_weekly), ("1month", cached_monthly)):
-                if rows:
-                    result = analyze_timeframe(rows)
-                    if result:
-                        result["candles"] = rows[-120:]
-                        timeframe_data[key] = result
+            for interval, rows in raw.items():
+                result = analyze_timeframe(rows)
+                if result:
+                    result["candles"] = rows[-250:]
+                    timeframe_data[interval] = result
 
             if timeframe_data:
                 with lock:
                     live_price = state["gold"].get("price")
 
                 if live_price is None:
-                    live_price = timeframe_data.get("1min", {}).get("price")
-                if live_price is None:
-                    live_price = timeframe_data.get("5min", {}).get("price")
-
-                # Require the core MTF set before changing the AI conclusion.
-                # This prevents a partial-data spike from producing a false signal.
-                core_ready = all(timeframe_data.get(k) for k in ("5min", "15min", "1h", "4h"))
-
-                if live_price is not None and core_ready:
-                    ai = build_ai_analysis(timeframe_data, live_price)
-                    trade_plan = build_trade_plan(timeframe_data, live_price, ai)
                     five = timeframe_data.get("5min", {})
+                    live_price = five.get("price")
 
+                ai = build_ai_analysis(timeframe_data, live_price)
+                trade_plan = build_trade_plan(timeframe_data, live_price, ai)
+                phase = build_market_phase(timeframe_data)
+                five = timeframe_data.get("5min", {})
+
+                with lock:
+                    state["gold"]["timeframes"] = timeframe_data
+                    state["gold"]["candles"] = {
+                        k: v.get("candles", []) for k, v in timeframe_data.items()
+                    }
+                    state["gold"]["trade_plan"] = trade_plan
+                    state["gold"]["market_phase"] = phase
+                    state["gold"].update({
+                        "trend": five.get("trend", "WAITING"),
+                        "momentum": five.get("momentum", "WAITING"),
+                        "structure": five.get("structure", "WAITING"),
+                        "rsi": five.get("rsi"),
+                        "ema20": five.get("ema20"),
+                        "ema50": five.get("ema50"),
+                        "support": five.get("support"),
+                        "resistance": five.get("resistance"),
+                        "liquidity_high": five.get("liquidity_high"),
+                        "liquidity_low": five.get("liquidity_low"),
+                        "sweep": five.get("sweep", "NONE"),
+                        "signal": ai["signal"],
+                        "confidence": ai["confidence"],
+                        "score": ai["score"],
+                        "error": None if timeframe_data else state["gold"].get("error"),
+                    })
                     record_signal_history(ai, live_price)
 
-                    with lock:
-                        state["gold"]["timeframes"] = timeframe_data
-                        state["gold"]["candles"] = {k: v.get("candles", []) for k, v in timeframe_data.items()}
-                        state["gold"]["trade_plan"] = trade_plan
-                        state["gold"].update({
-                            "trend": five.get("trend", "NEUTRAL"),
-                            "momentum": five.get("momentum", "NEUTRAL"),
-                            "structure": five.get("structure", "RANGE"),
-                            "rsi": five.get("rsi"),
-                            "ema20": five.get("ema20"),
-                            "ema50": five.get("ema50"),
-                            "support": five.get("support"),
-                            "resistance": five.get("resistance"),
-                            "liquidity_high": five.get("liquidity_high"),
-                            "liquidity_low": five.get("liquidity_low"),
-                            "sweep": five.get("sweep", "NONE"),
-                            "signal": ai["signal"],
-                            "confidence": ai["confidence"],
-                            "score": ai["score"],
-                            "updated": now_text(),
-                            "error": None,
-                            "connection": "CONNECTED" if state["gold"].get("price") is not None else "CONNECTED (CANDLE)",
-                        })
-
-                    print(f"AI UPDATE: price={live_price} score={ai['score']} decision={ai['signal']}")
-                    broadcast()
-                elif not core_ready:
-                    print("AI WAIT: waiting for complete 5m/15m/1H/4H candle set")
+                print(f"AI UPDATE: price={live_price} score={ai['score']} decision={ai['signal']} candles={','.join(timeframe_data.keys())}")
+                broadcast()
+            else:
+                print("AI UPDATE: no candle data available; WebSocket price remains live")
 
         except Exception as exc:
             print("AI LOOP ERROR:", repr(exc))
-            set_error(str(exc))
 
-        time.sleep(10)
+        # The individual timeframe schedules above control REST usage.
+        time.sleep(5)
 
 
 # =========================================================
@@ -1093,22 +1057,6 @@ def api_market():
 
 
 # =========================================================
-# CANDLE API (READ CACHE ONLY)
-# =========================================================
-
-@app.route("/api/candles/<interval>")
-def api_candles(interval):
-    """Return already-loaded candles without triggering a new Twelve Data call."""
-    if interval not in CANDLE_INTERVALS:
-        return jsonify({"error": "unsupported interval"}), 400
-
-    start_workers()
-    with lock:
-        rows = state["gold"].get("candles", {}).get(interval, [])
-    return jsonify({"status": "ok", "interval": interval, "values": rows})
-
-
-# =========================================================
 # SSE STREAM
 # =========================================================
 
@@ -1206,13 +1154,12 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "Trading-AI",
-        "gold_connection": state["gold"]["connection"],
-        "gold_price": state["gold"]["price"],
-        "api_credits_used": api_usage.get("credits_used"),
-        "api_credits_left": api_usage.get("credits_left"),
-        "api_last_status": api_usage.get("last_status"),
-        "api_last_error": api_usage.get("last_error"),
-        "time": now_text()
+        "gold_connection":
+            state["gold"]["connection"],
+        "gold_price":
+            state["gold"]["price"],
+        "time":
+            now_text()
     })
 
 
