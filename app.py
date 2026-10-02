@@ -784,6 +784,62 @@ def build_ai_analysis(timeframes, live_price):
 
 
 
+# =========================================================
+# MARKET PHASE
+# =========================================================
+
+def build_market_phase(timeframes, ai):
+    """
+    Descriptive multi-timeframe market phase.
+    Does not create a trade signal by itself.
+    """
+    five = timeframes.get("5min", {}) or {}
+    fifteen = timeframes.get("15min", {}) or {}
+    one_hour = timeframes.get("1h", {}) or {}
+    four_hour = timeframes.get("4h", {}) or {}
+
+    frames = [five, fifteen, one_hour, four_hour]
+    bullish = sum(1 for tf in frames if str(tf.get("trend", "")).upper() == "BULLISH")
+    bearish = sum(1 for tf in frames if str(tf.get("trend", "")).upper() == "BEARISH")
+    ready_count = sum(1 for tf in frames if tf.get("ema20") is not None)
+
+    signal = str((ai or {}).get("signal", "WAIT")).upper()
+    try:
+        score = float((ai or {}).get("score", 0) or 0)
+    except Exception:
+        score = 0
+
+    if ready_count == 0:
+        phase = "INITIALIZING"
+        duration = "Waiting for genuine market candles."
+    elif bullish >= 3 and bearish == 0:
+        phase = "BULLISH TREND"
+        duration = "Multi-timeframe bullish alignment."
+    elif bearish >= 3 and bullish == 0:
+        phase = "BEARISH TREND"
+        duration = "Multi-timeframe bearish alignment."
+    elif signal == "BUY" and score >= 6:
+        phase = "BULLISH MOMENTUM"
+        duration = "Short-term bullish signal with confirmation."
+    elif signal == "SELL" and score <= -6:
+        phase = "BEARISH MOMENTUM"
+        duration = "Short-term bearish signal with confirmation."
+    elif bullish > 0 and bearish > 0:
+        phase = "TRANSITION / CONFLICT"
+        duration = "Timeframes are not fully aligned."
+    else:
+        phase = "RANGE / NEUTRAL"
+        duration = "No clear multi-timeframe directional alignment."
+
+    return {
+        "phase": phase,
+        "duration": duration,
+        "bullish_timeframes": bullish,
+        "bearish_timeframes": bearish,
+        "ready_timeframes": ready_count,
+    }
+
+
 def build_trade_plan(timeframes, live_price, ai):
     """Transparent planning framework; targets are rule-based, not guarantees."""
     if live_price is None or ai["signal"] == "WAIT":
