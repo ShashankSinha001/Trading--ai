@@ -108,6 +108,11 @@ state = {
         "connection": "CONNECTING",
         "updated": None,
 
+        # Live-price accuracy / freshness tracking
+        "price_received_at": 0,
+        "price_event_timestamp": 0,
+        "price_source": "NONE",
+
         "timeframes": {},
         "candles": {},
 
@@ -205,33 +210,55 @@ def broadcast():
                 clients.remove(q)
 
 
-def set_gold_price(price, source="Twelve Data REST"):
+def set_gold_price(price, source="Twelve Data REST", event_timestamp=None, is_ws=False):
+    """Store the latest valid Gold price with freshness and source tracking."""
+    global last_ws_tick_time
+
     price = number(price)
+    if price is None or price <= 0:
+        return False
 
-    if price is None:
-        return
+    received_ts = time.time()
 
-    # Feed every real price update into the local candle engine.
-    # This works for both WebSocket ticks and REST fallback ticks.
+    # Twelve Data WebSocket price events include a UNIX timestamp.
+    # Normalize milliseconds to seconds defensively.
+    provider_ts = number(event_timestamp)
+    if provider_ts is not None and provider_ts > 100000000000:
+        provider_ts /= 1000.0
+
+    # Never allow an older WebSocket event to overwrite a newer one.
+    if is_ws and provider_ts is not None:
+        with lock:
+            previous_ts = number(state["gold"].get("price_event_timestamp")) or 0
+        if previous_ts > 0 and provider_ts < previous_ts:
+            return False
+
+    candle_ts = provider_ts if provider_ts is not None else received_ts
+
     try:
-        on_live_gold_tick(
-            price,
-            time.time()
-        )
+        on_live_gold_tick(price, candle_ts)
     except Exception as exc:
-        print(
-            "LOCAL CANDLE TICK ERROR:",
-            repr(exc)
-        )
+        print("LOCAL CANDLE TICK ERROR:", repr(exc), flush=True)
 
     with lock:
         state["gold"]["price"] = price
         state["gold"]["updated"] = now_text()
-        state["gold"]["connection"] = "CONNECTED"
+        state["gold"]["price_received_at"] = received_ts
+        state["gold"]["price_event_timestamp"] = (
+            provider_ts if provider_ts is not None else received_ts
+        )
+        state["gold"]["price_source"] = source
         state["gold"]["data_source"] = source
+        state["gold"]["connection"] = (
+            "CONNECTED" if is_ws else "REST FALLBACK"
+        )
         state["gold"]["error"] = None
 
+    if is_ws:
+        last_ws_tick_time = received_ts
+
     broadcast()
+    return True
 
 
 # ============================================================
@@ -302,7 +329,7 @@ def rsi(values, period=14):
 # REST PRICE FALLBACK
 # ============================================================
 
-def get_live_price():
+def get_live_price(force=False):
 
     global api_backoff_until
 
@@ -324,7 +351,8 @@ def get_live_price():
         cached_time = price_cache.get("timestamp", 0)
 
         if (
-            cached_price is not None
+            not force
+            and cached_price is not None
             and now - cached_time < 30
         ):
             return cached_price
@@ -672,7 +700,6 @@ def update_1m_from_tick(price, ts=None):
                     price
                 )
                 last["close"] = price
-                last_ws_tick_time = time.time()
                 return
 
         candles.append({
@@ -686,7 +713,6 @@ def update_1m_from_tick(price, ts=None):
         if len(candles) > 1500:
             del candles[:-1500]
 
-        last_ws_tick_time = time.time()
 
 
 def update_5m_from_tick(price, ts=None):
@@ -721,7 +747,6 @@ def update_5m_from_tick(price, ts=None):
                     price
                 )
                 last["close"] = price
-                last_ws_tick_time = time.time()
                 return
 
             # If the seed's latest candle is older than the current
@@ -739,7 +764,6 @@ def update_5m_from_tick(price, ts=None):
                 if len(candles) > 5000:
                     del candles[:-5000]
 
-                last_ws_tick_time = time.time()
                 return
 
         # No seed available: start a live-only 5m stream.
@@ -754,7 +778,6 @@ def update_5m_from_tick(price, ts=None):
         if len(candles) > 5000:
             del candles[:-5000]
 
-        last_ws_tick_time = time.time()
 
 
 def on_live_gold_tick(price, ts=None):
@@ -1607,40 +1630,34 @@ def record_signal_history(
 
 def gold_price_loop():
 
-    """
-    REST is only a fallback for price.
-
-    If WebSocket has delivered a recent tick, no REST price request
-    is made. If WS is stale, REST price is checked infrequently.
-    """
+    """REST is a fallback only when the WebSocket is not fresh."""
     while True:
-
         try:
-            with lock:
-                current_price = state["gold"].get("price")
-
+            now = time.time()
             ws_fresh = (
                 last_ws_tick_time > 0
-                and time.time() - last_ws_tick_time < 90
+                and now - last_ws_tick_time < 90
             )
 
             if not ws_fresh:
-                price = get_live_price()
+                # Force a real REST request here. Never promote an old
+                # 30-second cache entry to a new "live" tick.
+                price = get_live_price(force=True)
 
                 if price is not None:
                     set_gold_price(
                         price,
-                        "Twelve Data REST fallback"
+                        "Twelve Data REST fallback",
+                        event_timestamp=None,
+                        is_ws=False
                     )
 
         except Exception as exc:
-            print(
-                "GOLD PRICE LOOP ERROR:",
-                repr(exc)
-            )
+            print("GOLD PRICE LOOP ERROR:", repr(exc), flush=True)
 
-        # Keep REST fallback deliberately slow.
-        time.sleep(120)
+        # Faster fallback than the old 120-second loop, while still avoiding
+        # aggressive REST polling. WebSocket remains the primary feed.
+        time.sleep(30)
 
 
 def gold_analysis_loop():
@@ -1980,9 +1997,15 @@ def gold_websocket_loop():
                         and price is not None
                     ):
 
+                        provider_timestamp = number(
+                            message.get("timestamp")
+                        )
+
                         set_gold_price(
                             price,
-                            "Twelve Data WebSocket"
+                            "Twelve Data WebSocket",
+                            event_timestamp=provider_timestamp,
+                            is_ws=True
                         )
 
                 elif event == "subscribe-status":
@@ -2911,6 +2934,28 @@ ${
 }
 
 
+function updateGoldPriceStatus(g){
+
+const el=document.getElementById("gold-live-status");
+if(!el)return;
+
+const received=Number(g.price_received_at||0);
+if(!received){
+ el.textContent="● WAITING FOR PRICE";
+ return;
+}
+
+const age=Math.max(0,Date.now()/1000-received);
+
+if(age<=15){
+ el.textContent="● LIVE";
+}else if(age<=60){
+ el.textContent=`● DELAYED • ${Math.floor(age)}s`;
+}else{
+ el.textContent=`● STALE • ${Math.floor(age)}s`;
+}
+}
+
 function render(data){
 
 latestData=data;
@@ -2938,8 +2983,8 @@ document.getElementById(
 ${fmt(g.price)}
 </div>
 
-<div class="live">
-● LIVE
+<div class="live" id="gold-live-status">
+● CHECKING PRICE
 </div>
 
 <div class="connection">
@@ -3230,6 +3275,8 @@ activeTF
 ] || []
 );
 
+updateGoldPriceStatus(g);
+
 }
 
 
@@ -3242,6 +3289,12 @@ render(latestData);
 
 }
 
+
+setInterval(()=>{
+ if(latestData && latestData.gold){
+  updateGoldPriceStatus(latestData.gold);
+ }
+},1000);
 
 fetch(
 "/api/market",
