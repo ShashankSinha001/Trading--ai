@@ -283,9 +283,10 @@ def set_gold_price(
 
             latest_receive_timestamp = receive_ts
 
-        # IMPORTANT: Twelve Data provider timestamps can be stale/repeated
-        # across multiple WebSocket price events. For live freshness and
-        # local candle timing, use the exact server receive time.
+        # Twelve Data is currently sending a stale/frozen provider timestamp
+        # on repeated price events. For LIVE freshness and local candle timing,
+        # use the exact server receive time of each accepted WebSocket tick.
+        # Keep provider_ts in state for diagnostics only.
         candle_ts = receive_ts
 
         try:
@@ -304,7 +305,7 @@ def set_gold_price(
             state["gold"]["updated"] = (
                 time.strftime(
                     "%H:%M:%S",
-                    time.localtime(candle_ts)
+                    time.localtime(receive_ts)
                 )
             )
             state["gold"]["connection"] = "CONNECTED"
@@ -2784,7 +2785,7 @@ const el=document.getElementById("goldTickAge");
 
 if(el)
 el.textContent=formatTickAge(
-latestData.gold.provider_timestamp,
+latestData.gold.receive_timestamp,
 latestData.gold.connection
 );
 
