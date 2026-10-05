@@ -2086,12 +2086,60 @@ def gold_websocket_loop():
                         and price is not None
                     ):
 
-                        set_gold_price(
+                        # ====================================================
+                        # LIVE FEED DIAGNOSTIC — NO TRADING LOGIC CHANGE
+                        # ====================================================
+                        debug_receive_ts = time.time()
+                        previous_receive_ts = getattr(
+                            gold_websocket_loop, "_debug_previous_receive_ts", None
+                        )
+                        previous_provider_ts = getattr(
+                            gold_websocket_loop, "_debug_previous_provider_ts", None
+                        )
+
+                        receive_gap = (
+                            debug_receive_ts - previous_receive_ts
+                            if previous_receive_ts is not None
+                            else None
+                        )
+                        provider_gap = (
+                            provider_timestamp - previous_provider_ts
+                            if provider_timestamp is not None and previous_provider_ts is not None
+                            else None
+                        )
+                        provider_age = (
+                            debug_receive_ts - provider_timestamp
+                            if provider_timestamp is not None
+                            else None
+                        )
+
+                        print(
+                            "WS TICK RECEIVED | "
+                            f"price={price} | "
+                            f"provider_ts={provider_timestamp} | "
+                            f"server_received={debug_receive_ts:.3f} | "
+                            f"provider_age={(f'{provider_age:.3f}s' if provider_age is not None else 'N/A')} | "
+                            f"receive_gap={(f'{receive_gap:.3f}s' if receive_gap is not None else 'N/A')} | "
+                            f"provider_gap={(f'{provider_gap:.3f}s' if provider_gap is not None else 'N/A')}"
+                        )
+
+                        accepted = set_gold_price(
                             price,
                             "Twelve Data WebSocket",
                             provider_timestamp=provider_timestamp,
                             is_websocket=True
                         )
+
+                        print(
+                            "WS TICK PROCESSED | "
+                            f"accepted={accepted} | "
+                            f"price={price} | "
+                            f"server_received={debug_receive_ts:.3f}"
+                        )
+
+                        gold_websocket_loop._debug_previous_receive_ts = debug_receive_ts
+                        if provider_timestamp is not None:
+                            gold_websocket_loop._debug_previous_provider_ts = provider_timestamp
 
                 elif event == "subscribe-status":
 
