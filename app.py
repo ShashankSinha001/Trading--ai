@@ -3087,7 +3087,7 @@ ${fmt(g.price)}
 </div>
 
 <div class="live">
-● LIVE
+${(Number.isFinite(Number(g.price)) && String(g.connection || "").toUpperCase() === "CONNECTED") ? "● LIVE" : "● WAITING FOR PRICE"}
 </div>
 
 <div class="connection">
