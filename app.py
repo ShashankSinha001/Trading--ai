@@ -283,7 +283,10 @@ def set_gold_price(
 
             latest_receive_timestamp = receive_ts
 
-        candle_ts = provider_ts or receive_ts
+        # IMPORTANT: Twelve Data provider timestamps can be stale/repeated
+        # across multiple WebSocket price events. For live freshness and
+        # local candle timing, use the exact server receive time.
+        candle_ts = receive_ts
 
         try:
             on_live_gold_tick(
@@ -2752,12 +2755,12 @@ return Number.isNaN(n)
 }
 
 
-function formatTickAge(providerTs, connection){
+function formatTickAge(receiveTs, connection){
 
-if(!providerTs || connection !== "CONNECTED")
+if(!receiveTs || connection !== "CONNECTED")
 return "—";
 
-let age=Math.max(0, Date.now()/1000-Number(providerTs));
+let age=Math.max(0, Date.now()/1000-Number(receiveTs));
 
 if(!Number.isFinite(age))
 return "—";
@@ -3148,7 +3151,7 @@ ${g.data_source || "Twelve Data"}
 Updated:
 ${g.updated || "—"}
 • Tick age:
-<span id="goldTickAge">${formatTickAge(g.provider_timestamp, g.connection)}</span>
+<span id="goldTickAge">${formatTickAge(g.receive_timestamp, g.connection)}</span>
 </div>
 
 
